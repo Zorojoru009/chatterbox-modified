@@ -506,6 +506,10 @@ Initial implementation status:
 - Added channel-specific presets based on the mechanism-first mental-models editorial identity.
 - Added opt-in automatic Whisper regeneration for `Generate All` chunks scoring below the selected threshold, defaulting to 0.90 with one retry.
 - Added Previous/Next chunk navigation so users do not need to type chunk numbers for normal review.
+- Added a model-cache clear action to release cached TTS models and GPU memory.
+- Added protection against mixing Turbo, Nano, and Original audio within one session.
+- Added reference-audio duration preflight with the Chatterbox five-second requirement.
+- Added streamed model-loading status for each selected CUDA device plus batch-loading progress feedback.
 - Added downloadable JSON validation reports with per-chunk summaries.
 - Added optional MP3 export through ffmpeg during finalization.
 - Added live progress updates for batch generation and validation operations.

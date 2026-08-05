@@ -1,4 +1,5 @@
 import json
+import gc
 import random
 import re
 import shutil
@@ -398,6 +399,17 @@ def copy_reference_to_session(session: dict[str, Any], reference_audio_path: str
     if not source.exists():
         raise gr.Error(f"Reference audio does not exist: {reference_audio_path}")
 
+    if ta is not None:
+        try:
+            info = ta.info(str(source))
+            duration_s = float(info.num_frames / info.sample_rate) if info.sample_rate else 0.0
+            if duration_s <= 5.0:
+                raise gr.Error(f"Reference audio must be longer than 5 seconds; this file is {duration_s:.2f} seconds.")
+        except gr.Error:
+            raise
+        except Exception as exc:
+            raise gr.Error(f"Could not inspect reference audio: {exc}") from exc
+
     ext = source.suffix or ".wav"
     dest = session_dir(session) / "reference" / f"reference{ext}"
     if source.resolve() != dest.resolve():
@@ -494,6 +506,29 @@ def get_model_adapter(model_cache: dict[str, Any] | None, model_name: str, devic
         if cache_key not in MODEL_ADAPTERS:
             MODEL_ADAPTERS[cache_key] = ModelAdapter(model_name, selected_device)
     return cache, MODEL_ADAPTERS[cache_key]
+
+
+def clear_model_cache(model_cache):
+    with MODEL_ADAPTERS_LOCK:
+        MODEL_ADAPTERS.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {}, "Cleared cached TTS models and released available GPU memory.", "No TTS models currently loaded."
+
+
+def ensure_model_consistency(session: dict[str, Any], model_name: str):
+    existing_models = {
+        chunk.get("model_name")
+        for chunk in session.get("chunks", [])
+        if chunk.get("audio_path") and chunk.get("model_name")
+    }
+    if existing_models and existing_models != {model_name}:
+        names = ", ".join(sorted(existing_models))
+        raise gr.Error(
+            f"This session already contains audio generated with `{names}`. "
+            f"It cannot be mixed with `{model_name}`. Use the same model or create a new session."
+        )
 
 
 def create_session(project_name, output_filename, model_name, full_text, target_chars):
@@ -645,6 +680,7 @@ def generate_selected_chunk(
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
+    ensure_model_consistency(session, model_name)
     session["model_name"] = model_name
     session["generation_settings"] = collect_generation_settings(
         temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness
@@ -760,6 +796,7 @@ def generate_all_chunks(
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
+    ensure_model_consistency(session, model_name)
     session["model_name"] = model_name
     settings = collect_generation_settings(
         temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness
@@ -781,7 +818,9 @@ def generate_all_chunks(
     save_session(session)
 
     if len(devices) == 1:
+        progress(0, desc=f"Loading {model_name} on {devices[0]}...")
         model_cache, adapter = get_model_adapter(model_cache, model_name, devices[0])
+        progress(0.05, desc=f"Loaded {model_name} on {devices[0]}; generating chunks...")
         for chunk_index, chunk in enumerate(chunks_to_generate, start=1):
             try:
                 wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
@@ -809,9 +848,11 @@ def generate_all_chunks(
         )
 
     adapters: list[ModelAdapter] = []
+    progress(0, desc=f"Loading {model_name} on {', '.join(devices)}...")
     for device in devices:
         model_cache, adapter = get_model_adapter(model_cache, model_name, device)
         adapters.append(adapter)
+        progress(len(adapters) / len(devices) * 0.1, desc=f"Loaded {model_name} on {device} ({len(adapters)}/{len(devices)})")
 
     future_to_chunk = {}
     max_workers = len(adapters)
@@ -882,9 +923,13 @@ def gpu_status_text(enable_parallel, max_parallel_devices):
 
 def warm_model_cache(model_cache, model_name, enable_parallel, max_parallel_devices):
     devices = available_generation_devices(bool(enable_parallel), int(max_parallel_devices or 1))
-    for device in devices:
-        model_cache, _adapter = get_model_adapter(model_cache, model_name, device)
-    return model_cache, f"Loaded `{model_name}` on: `{', '.join(devices)}`."
+    current_cache = model_cache or {}
+    yield current_cache, f"Preparing to load `{model_name}` on `{', '.join(devices)}`...", "Model loading has started."
+    for device_index, device in enumerate(devices, start=1):
+        yield current_cache, f"Loading `{model_name}` on `{device}` ({device_index}/{len(devices)})...", f"Loading `{model_name}` on `{device}`..."
+        current_cache, _adapter = get_model_adapter(current_cache, model_name, device)
+        loaded = ", ".join(devices[:device_index])
+        yield current_cache, f"Loaded `{model_name}` on `{loaded}`.", f"Loaded `{model_name}` on `{device}` ({device_index}/{len(devices)})."
 
 
 def normalize_validation_text(value: str) -> str:
@@ -1217,6 +1262,7 @@ def regenerate_failed_chunks(
     if not session:
         raise gr.Error("Create or load a session first.")
     ensure_validation_enabled(validation_enabled)
+    ensure_model_consistency(session, model_name)
     failed = [
         chunk for chunk in session["chunks"]
         if chunk.get("validation_status") == "needs_review" and chunk["status"] != "excluded"
@@ -1331,6 +1377,14 @@ def merge_chunks(session, output_filename, silence_ms, require_approved, export_
         raise gr.Error("Create or load a session first.")
     if ta is None:
         raise gr.Error("torchaudio is required to merge chunks but is not available.")
+
+    existing_models = {
+        chunk.get("model_name")
+        for chunk in session.get("chunks", [])
+        if chunk.get("audio_path") and chunk.get("model_name")
+    }
+    if len(existing_models) > 1:
+        raise gr.Error(f"Cannot finalize a mixed-model session: {', '.join(sorted(existing_models))}.")
 
     filename = safe_wav_filename(output_filename or session.get("output_filename"))
     session["output_filename"] = filename
@@ -1454,9 +1508,11 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                 enable_parallel = gr.Checkbox(value=True, label="Use multiple CUDA GPUs for Generate All when available")
                 max_parallel_devices = gr.Slider(1, 8, step=1, value=2, label="Max GPU workers")
                 gpu_status = gr.Markdown(gpu_status_text(True, 2))
+                model_load_status = gr.Markdown("No TTS models currently loaded.")
                 with gr.Row():
                     refresh_gpu_btn = gr.Button("Refresh GPU Status")
                     warm_models_btn = gr.Button("Load Selected Model on Batch Devices")
+                    clear_models_btn = gr.Button("Clear Model Cache")
 
             with gr.Accordion("Whisper Validation", open=True):
                 validation_enabled = gr.Checkbox(
@@ -1621,7 +1677,13 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     warm_models_btn.click(
         fn=warm_model_cache,
         inputs=[model_cache_state, model_name, enable_parallel, max_parallel_devices],
-        outputs=[model_cache_state, status],
+        outputs=[model_cache_state, status, model_load_status],
+    )
+
+    clear_models_btn.click(
+        fn=clear_model_cache,
+        inputs=[model_cache_state],
+        outputs=[model_cache_state, status, model_load_status],
     )
 
     validate_selected_btn.click(

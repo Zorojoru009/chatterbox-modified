@@ -5,6 +5,8 @@ import shutil
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,11 @@ except Exception:  # pragma: no cover - surfaced at runtime in the UI
 from chatterbox.tts import ChatterboxTTS
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 
+try:
+    from faster_whisper import WhisperModel
+except Exception:  # pragma: no cover - optional Kaggle dependency
+    WhisperModel = None
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SESSION_ROOT = Path("/kaggle/working/chatterbox_sessions") if Path("/kaggle/working").exists() else Path("outputs/chatterbox_sessions")
@@ -30,6 +37,8 @@ MODEL_ORIGINAL = "Original"
 MODEL_CHOICES = [MODEL_TURBO, MODEL_NANO, MODEL_ORIGINAL]
 MODEL_ADAPTERS: dict[str, "ModelAdapter"] = {}
 MODEL_ADAPTERS_LOCK = threading.Lock()
+WHISPER_MODELS: dict[str, Any] = {}
+WHISPER_MODELS_LOCK = threading.Lock()
 
 EVENT_TAGS = [
     "[clear throat]", "[sigh]", "[shush]", "[cough]", "[groan]",
@@ -154,6 +163,9 @@ def make_session(project_name: str, output_filename: str, model_name: str, full_
                 "transcript": None,
                 "text_score": None,
                 "voice_score": None,
+                "validation_status": None,
+                "validation_error": None,
+                "validation_path": None,
                 "error": None,
                 "model_name": None,
                 "device": None,
@@ -273,9 +285,11 @@ def format_chunk_table(session: dict[str, Any] | None) -> list[list[Any]]:
                 len(chunk["text"]),
                 chunk.get("model_name") or "",
                 chunk.get("device") or "",
+                f"{chunk['text_score']:.3f}" if chunk.get("text_score") is not None else "",
+                chunk.get("validation_status") or "",
                 preview,
                 chunk.get("audio_path") or "",
-                chunk.get("error") or "",
+                chunk.get("transcript") or chunk.get("validation_error") or chunk.get("error") or "",
             ]
         )
     return rows
@@ -444,7 +458,13 @@ def load_session(path_value):
 def load_selected_chunk(session, chunk_number):
     chunk = get_chunk(session, int(chunk_number or 1))
     audio_path = chunk.get("audio_path")
-    return chunk["text"], audio_path, status_message(session, f"Selected chunk {chunk['index']}.")
+    return (
+        chunk["text"],
+        audio_path,
+        chunk.get("transcript") or "",
+        validation_details(chunk),
+        status_message(session, f"Selected chunk {chunk['index']}.")
+    )
 
 
 def save_selected_chunk(session, chunk_number, edited_text):
@@ -455,13 +475,23 @@ def save_selected_chunk(session, chunk_number, edited_text):
     chunk["transcript"] = None
     chunk["text_score"] = None
     chunk["voice_score"] = None
+    chunk["validation_status"] = None
+    chunk["validation_error"] = None
+    chunk["validation_path"] = None
     chunk["error"] = None
     chunk["model_name"] = None
     chunk["device"] = None
     text_path = session_dir(session) / "chunks" / f"{chunk['index']:04d}.txt"
     text_path.write_text(chunk["text"], encoding="utf-8")
     save_session(session)
-    return session, format_chunk_table(session), None, status_message(session, f"Saved chunk {chunk['index']}. Existing audio cleared.")
+    return (
+        session,
+        format_chunk_table(session),
+        None,
+        "",
+        validation_details(chunk),
+        status_message(session, f"Saved chunk {chunk['index']}. Existing audio cleared."),
+    )
 
 
 def generate_one_chunk(
@@ -507,6 +537,11 @@ def generate_one_chunk(
     chunk["status"] = "generated"
     chunk["audio_path"] = str(audio_path)
     chunk["model_name"] = adapter.model_name
+    chunk["transcript"] = None
+    chunk["text_score"] = None
+    chunk["validation_status"] = None
+    chunk["validation_error"] = None
+    chunk["validation_path"] = None
     chunk["error"] = None
     save_session(session)
 
@@ -546,7 +581,15 @@ def generate_selected_chunk(
         chunk["error"] = str(exc)
         save_session(session)
         raise
-    return session, model_cache, format_chunk_table(session), chunk.get("audio_path"), status_message(session, f"Generated chunk {chunk['index']}.")
+    return (
+        session,
+        model_cache,
+        format_chunk_table(session),
+        chunk.get("audio_path"),
+        chunk.get("transcript") or "",
+        validation_details(chunk),
+        status_message(session, f"Generated chunk {chunk['index']}.")
+    )
 
 
 def collect_generation_settings(temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness):
@@ -599,6 +642,11 @@ def save_chunk_audio(session: dict[str, Any], chunk: dict[str, Any], wav: torch.
     chunk["audio_path"] = str(audio_path)
     chunk["model_name"] = model_name
     chunk["device"] = device
+    chunk["transcript"] = None
+    chunk["text_score"] = None
+    chunk["validation_status"] = None
+    chunk["validation_error"] = None
+    chunk["validation_path"] = None
     chunk["error"] = None
     return str(audio_path)
 
@@ -733,6 +781,234 @@ def warm_model_cache(model_cache, model_name, enable_parallel, max_parallel_devi
     return model_cache, f"Loaded `{model_name}` on: `{', '.join(devices)}`."
 
 
+def normalize_validation_text(value: str) -> str:
+    """Normalize text for ASR comparison while ignoring Chatterbox event tags."""
+    value = re.sub(r"\[[^\]]+\]", " ", value or "")
+    value = value.lower().replace("’", "'")
+    value = re.sub(r"[^a-z0-9']+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def validation_comparison(expected: str, transcript: str, threshold: float) -> dict[str, Any]:
+    expected_normalized = normalize_validation_text(expected)
+    transcript_normalized = normalize_validation_text(transcript)
+    expected_words = expected_normalized.split()
+    transcript_words = transcript_normalized.split()
+
+    if not transcript_normalized:
+        score = 0.0
+    else:
+        score = SequenceMatcher(None, expected_normalized, transcript_normalized).ratio()
+
+    expected_counts = Counter(expected_words)
+    transcript_counts = Counter(transcript_words)
+    missing = list((expected_counts - transcript_counts).elements())
+    extra = list((transcript_counts - expected_counts).elements())
+    passed = bool(transcript_normalized) and score >= float(threshold)
+    return {
+        "expected_normalized": expected_normalized,
+        "transcript_normalized": transcript_normalized,
+        "score": round(score, 4),
+        "threshold": float(threshold),
+        "passed": passed,
+        "missing_words": missing[:30],
+        "extra_words": extra[:30],
+        "expected_word_count": len(expected_words),
+        "transcript_word_count": len(transcript_words),
+    }
+
+
+def get_whisper_model(model_name: str, device: str):
+    if WhisperModel is None:
+        raise gr.Error(
+            "faster-whisper is not installed. Install it in Kaggle with `pip install faster-whisper`, then restart the app."
+        )
+
+    selected_device = str(device or "cpu")
+    cache_key = f"{model_name}:{selected_device}"
+    with WHISPER_MODELS_LOCK:
+        if cache_key not in WHISPER_MODELS:
+            if selected_device.startswith("cuda"):
+                device_index = int(selected_device.split(":", 1)[1]) if ":" in selected_device else 0
+                WHISPER_MODELS[cache_key] = WhisperModel(
+                    model_name,
+                    device="cuda",
+                    device_index=device_index,
+                    compute_type="float16",
+                )
+            else:
+                WHISPER_MODELS[cache_key] = WhisperModel(
+                    model_name,
+                    device="cpu",
+                    compute_type="int8",
+                )
+    return WHISPER_MODELS[cache_key]
+
+
+def transcribe_audio(audio_path: str, whisper_model_name: str, whisper_device: str) -> str:
+    if not audio_path or not Path(audio_path).exists():
+        raise gr.Error("Generate the chunk audio before validating it.")
+    model = get_whisper_model(whisper_model_name, whisper_device)
+    segments, _info = model.transcribe(audio_path, beam_size=5, vad_filter=True)
+    return " ".join(segment.text.strip() for segment in segments).strip()
+
+
+def validation_path(session: dict[str, Any], chunk: dict[str, Any]) -> Path:
+    return session_dir(session) / "validation" / f"{chunk['index']:04d}.json"
+
+
+def validate_chunk(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    whisper_model_name: str,
+    whisper_device: str,
+    validation_threshold: float,
+) -> dict[str, Any]:
+    transcript = transcribe_audio(chunk.get("audio_path"), whisper_model_name, whisper_device)
+    comparison = validation_comparison(chunk["text"], transcript, float(validation_threshold))
+    result = {
+        "chunk_index": chunk["index"],
+        "audio_path": chunk.get("audio_path"),
+        "model_name": chunk.get("model_name"),
+        "whisper_model": whisper_model_name,
+        "whisper_device": whisper_device,
+        "transcript": transcript,
+        **comparison,
+    }
+    path = validation_path(session, chunk)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp.json")
+    temp_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
+
+    chunk["transcript"] = transcript
+    chunk["text_score"] = comparison["score"]
+    chunk["validation_status"] = "passed" if comparison["passed"] else "needs_review"
+    chunk["validation_error"] = None if comparison["passed"] else (
+        f"Missing: {', '.join(comparison['missing_words']) or 'none'}; "
+        f"Extra: {', '.join(comparison['extra_words']) or 'none'}"
+    )
+    chunk["validation_path"] = str(path)
+    # A new validation result supersedes a previous approval.
+    chunk["status"] = "validated" if comparison["passed"] else "needs_review"
+    return result
+
+
+def validation_details(chunk: dict[str, Any] | None) -> str:
+    if not chunk:
+        return "No chunk selected."
+    if not chunk.get("validation_status"):
+        return "This chunk has not been validated yet."
+    return (
+        f"**Validation:** `{chunk['validation_status']}`  \n"
+        f"**Text score:** `{chunk.get('text_score', 0):.3f}`  \n"
+        f"**Transcript:** {chunk.get('transcript') or '(empty)'}  \n"
+        f"**Details:** {chunk.get('validation_error') or 'No missing or extra words detected.'}"
+    )
+
+
+def ensure_validation_enabled(enabled: bool):
+    if not enabled:
+        raise gr.Error("Enable Whisper validation first, or continue without validation.")
+
+
+def validate_selected_chunk(session, chunk_number, whisper_model_name, whisper_device, validation_threshold, enabled):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    ensure_validation_enabled(enabled)
+    chunk = get_chunk(session, int(chunk_number or 1))
+    result = validate_chunk(session, chunk, whisper_model_name, whisper_device, float(validation_threshold))
+    save_session(session)
+    return (
+        session,
+        format_chunk_table(session),
+        chunk.get("transcript") or "",
+        validation_details(chunk),
+        status_message(session, f"Validated chunk {chunk['index']} with score {result['score']:.3f}."),
+    )
+
+
+def validate_all_chunks(session, whisper_model_name, whisper_device, validation_threshold, enabled):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    ensure_validation_enabled(enabled)
+    chunks = [chunk for chunk in session["chunks"] if chunk.get("audio_path") and chunk["status"] != "excluded"]
+    if not chunks:
+        raise gr.Error("Generate at least one chunk before validating.")
+
+    passed = 0
+    first_error = None
+    for chunk in chunks:
+        try:
+            result = validate_chunk(session, chunk, whisper_model_name, whisper_device, float(validation_threshold))
+            passed += int(result["passed"])
+            save_session(session)
+        except Exception as exc:
+            first_error = exc
+            chunk["validation_status"] = "error"
+            chunk["validation_error"] = str(exc)
+            save_session(session)
+
+    message = f"Validated {len(chunks)} chunk(s): {passed} passed, {len(chunks) - passed} need review."
+    if first_error:
+        message += f" First error: {first_error}"
+    return session, format_chunk_table(session), status_message(session, message)
+
+
+def regenerate_failed_chunks(
+    session,
+    model_cache,
+    model_name,
+    reference_audio_path,
+    temperature,
+    seed_num,
+    min_p,
+    top_p,
+    top_k,
+    repetition_penalty,
+    exaggeration,
+    cfg_weight,
+    norm_loudness,
+    enable_parallel,
+    max_parallel_devices,
+    validation_threshold,
+    whisper_model_name,
+    whisper_device,
+    validation_enabled,
+):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    ensure_validation_enabled(validation_enabled)
+    failed = [
+        chunk for chunk in session["chunks"]
+        if chunk.get("validation_status") == "needs_review" and chunk["status"] != "excluded"
+    ]
+    if not failed:
+        raise gr.Error("No chunks currently need review.")
+
+    session["model_name"] = model_name
+    settings = collect_generation_settings(
+        temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness
+    )
+    reference_audio_path = copy_reference_to_session(session, reference_audio_path)
+    devices = available_generation_devices(bool(enable_parallel), int(max_parallel_devices or 1))
+    model_cache, adapter = get_model_adapter(model_cache, model_name, devices[0])
+    for chunk in failed:
+        chunk["status"] = "generating"
+        chunk["validation_status"] = None
+        try:
+            wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
+            save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
+            validate_chunk(session, chunk, whisper_model_name, whisper_device, float(validation_threshold))
+            save_session(session)
+        except Exception as exc:
+            chunk["status"] = "failed"
+            chunk["error"] = str(exc)
+            save_session(session)
+
+    return session, model_cache, format_chunk_table(session), status_message(session, f"Regenerated {len(failed)} chunk(s) needing review.")
+
+
 def exclude_selected_chunk(session, chunk_number):
     chunk = get_chunk(session, int(chunk_number or 1))
     chunk["status"] = "excluded"
@@ -797,7 +1073,7 @@ def merge_chunks(session, output_filename, silence_ms, require_approved):
 
 with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     gr.Markdown("# ⚡ Chatterbox Narration Suite")
-    gr.Markdown("Phase 2 build: long-script chunking, session persistence, model selection, per-chunk regeneration, dual-GPU batch generation, and final merge.")
+    gr.Markdown("Phase 3 build: long-script chunking, session persistence, model selection, dual-GPU batch generation, Whisper validation, per-chunk regeneration, and final merge.")
 
     session_state = gr.State(None)
     model_cache_state = gr.State({})
@@ -855,11 +1131,33 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                     refresh_gpu_btn = gr.Button("Refresh GPU Status")
                     warm_models_btn = gr.Button("Load Selected Model on Batch Devices")
 
+            with gr.Accordion("Whisper Validation", open=True):
+                validation_enabled = gr.Checkbox(
+                    value=False,
+                    label="Enable Whisper validation (optional)",
+                    info="Leave disabled to generate and merge without installing or loading Whisper.",
+                )
+                whisper_model_name = gr.Dropdown(
+                    ["tiny.en", "base.en", "small.en", "medium.en"],
+                    value="small.en",
+                    label="Whisper model",
+                )
+                whisper_device = gr.Dropdown(
+                    ["cpu", "cuda:0", "cuda:1"],
+                    value="cuda:0" if torch.cuda.is_available() else "cpu",
+                    label="Whisper device",
+                )
+                validation_threshold = gr.Slider(0.50, 0.99, step=0.01, value=0.85, label="Pass score threshold")
+                with gr.Row():
+                    validate_selected_btn = gr.Button("Validate Selected")
+                    validate_all_btn = gr.Button("Validate All")
+                regenerate_failed_btn = gr.Button("Regenerate Chunks Needing Review")
+
             status = gr.Markdown("No active session.")
 
     chunk_table = gr.Dataframe(
-        headers=["#", "Status", "Chars", "Model", "Device", "Text", "Audio Path", "Error"],
-        datatype=["number", "str", "number", "str", "str", "str", "str", "str"],
+        headers=["#", "Status", "Chars", "Model", "Device", "Text Score", "Validation", "Text", "Audio Path", "Transcript / Error"],
+        datatype=["number", "str", "number", "str", "str", "str", "str", "str", "str", "str"],
         label="Chunks",
         interactive=False,
     )
@@ -872,6 +1170,8 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
             save_chunk_btn = gr.Button("Save Edited Chunk")
         with gr.Column():
             chunk_audio = gr.Audio(label="Selected/generated chunk audio")
+            chunk_transcript = gr.Textbox(label="Whisper transcript", lines=3, interactive=False)
+            chunk_validation = gr.Markdown("This chunk has not been validated yet.")
             with gr.Row():
                 generate_selected_btn = gr.Button("Generate Selected", variant="primary")
                 generate_all_btn = gr.Button("Generate All")
@@ -902,13 +1202,13 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     load_chunk_btn.click(
         fn=load_selected_chunk,
         inputs=[session_state, chunk_number],
-        outputs=[chunk_editor, chunk_audio, status],
+        outputs=[chunk_editor, chunk_audio, chunk_transcript, chunk_validation, status],
     )
 
     save_chunk_btn.click(
         fn=save_selected_chunk,
         inputs=[session_state, chunk_number, chunk_editor],
-        outputs=[session_state, chunk_table, chunk_audio, status],
+        outputs=[session_state, chunk_table, chunk_audio, chunk_transcript, chunk_validation, status],
     )
 
     generate_selected_btn.click(
@@ -929,7 +1229,7 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
             cfg_weight,
             norm_loudness,
         ],
-        outputs=[session_state, model_cache_state, chunk_table, chunk_audio, status],
+        outputs=[session_state, model_cache_state, chunk_table, chunk_audio, chunk_transcript, chunk_validation, status],
     )
 
     refresh_gpu_btn.click(
@@ -942,6 +1242,44 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
         fn=warm_model_cache,
         inputs=[model_cache_state, model_name, enable_parallel, max_parallel_devices],
         outputs=[model_cache_state, status],
+    )
+
+    validate_selected_btn.click(
+        fn=validate_selected_chunk,
+        inputs=[session_state, chunk_number, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
+        outputs=[session_state, chunk_table, chunk_transcript, chunk_validation, status],
+    )
+
+    validate_all_btn.click(
+        fn=validate_all_chunks,
+        inputs=[session_state, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
+        outputs=[session_state, chunk_table, status],
+    )
+
+    regenerate_failed_btn.click(
+        fn=regenerate_failed_chunks,
+        inputs=[
+            session_state,
+            model_cache_state,
+            model_name,
+            ref_wav,
+            temp,
+            seed_num,
+            min_p,
+            top_p,
+            top_k,
+            repetition_penalty,
+            exaggeration,
+            cfg_weight,
+            norm_loudness,
+            enable_parallel,
+            max_parallel_devices,
+            validation_threshold,
+            whisper_model_name,
+            whisper_device,
+            validation_enabled,
+        ],
+        outputs=[session_state, model_cache_state, chunk_table, status],
     )
 
     generate_all_btn.click(

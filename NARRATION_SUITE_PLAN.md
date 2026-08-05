@@ -464,6 +464,24 @@ Implement:
 - needs-review flags
 - regenerate failed chunks action
 
+Initial implementation status:
+
+- Added optional `faster-whisper` loading with CPU, `cuda:0`, and `cuda:1` device choices.
+- Added Whisper transcription for selected chunks and all generated chunks.
+- Added tag-aware text normalization so Chatterbox event tags do not count as missing speech.
+- Added SequenceMatcher scoring with missing-word and extra-word diagnostics.
+- Added atomic validation reports under `validation/{chunk_id}.json`.
+- Added per-chunk validation state, score, transcript, and review details to the chunk table.
+- Added `Regenerate Chunks Needing Review`, followed by automatic revalidation.
+
+Kaggle setup for this phase:
+
+```bash
+pip install faster-whisper
+```
+
+Use `small.en` on a T4 when quality is more important, or `base.en`/`tiny.en` when VRAM or runtime is constrained. Keep Whisper on one GPU and run validation after TTS generation if loading both models causes CUDA out-of-memory errors.
+
 ### Phase 4: voice/audio validation
 
 Implement:

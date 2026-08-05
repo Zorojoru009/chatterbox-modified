@@ -2,8 +2,10 @@ import json
 import random
 import re
 import shutil
+import subprocess
 import threading
 import uuid
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from collections import Counter
@@ -35,6 +37,13 @@ MODEL_TURBO = "Turbo"
 MODEL_NANO = "Nano"
 MODEL_ORIGINAL = "Original"
 MODEL_CHOICES = [MODEL_TURBO, MODEL_NANO, MODEL_ORIGINAL]
+PRESET_CHOICES = ["Custom", "Warm narration", "Neutral narration", "Energetic narration"]
+GENERATION_PRESETS = {
+    "Custom": (0.8, 0.95, 1000, 1.2, 0.05, 0.5, 0.5, True),
+    "Warm narration": (0.65, 0.92, 1000, 1.15, 0.05, 0.65, 0.45, True),
+    "Neutral narration": (0.55, 0.90, 800, 1.15, 0.05, 0.45, 0.55, True),
+    "Energetic narration": (0.9, 0.96, 1000, 1.2, 0.05, 0.85, 0.35, True),
+}
 MODEL_ADAPTERS: dict[str, "ModelAdapter"] = {}
 MODEL_ADAPTERS_LOCK = threading.Lock()
 WHISPER_MODELS: dict[str, Any] = {}
@@ -146,6 +155,49 @@ def load_session_from_path(path_value: str) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         session = json.load(f)
     return session
+
+
+def list_session_paths() -> list[str]:
+    if not SESSION_ROOT.exists():
+        return []
+    session_paths = [path for path in SESSION_ROOT.glob("*/session.json") if path.is_file()]
+    return [str(path) for path in sorted(session_paths, key=lambda item: item.stat().st_mtime, reverse=True)]
+
+
+def refresh_session_picker():
+    choices = list_session_paths()
+    return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+
+
+def apply_generation_preset(preset_name: str):
+    return GENERATION_PRESETS.get(preset_name, GENERATION_PRESETS["Custom"])
+
+
+def export_validation_report(session):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    report_dir = session_dir(session) / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    chunks = session.get("chunks", [])
+    report = {
+        "session_id": session.get("session_id"),
+        "project_name": session.get("project_name"),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "summary": {
+            "total_chunks": len(chunks),
+            "generated": sum(bool(chunk.get("audio_path")) for chunk in chunks),
+            "whisper_passed": sum(chunk.get("validation_status") == "passed" for chunk in chunks),
+            "whisper_needs_review": sum(chunk.get("validation_status") == "needs_review" for chunk in chunks),
+            "audio_passed": sum(chunk.get("audio_quality_status") == "passed" for chunk in chunks),
+            "audio_needs_review": sum(chunk.get("audio_quality_status") == "needs_review" for chunk in chunks),
+        },
+        "chunks": chunks,
+    }
+    report_path = report_dir / f"{safe_name(session.get('project_name'), 'narration')}_validation_report.json"
+    temp_path = report_path.with_suffix(".tmp.json")
+    temp_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(report_path)
+    return str(report_path), status_message(session, f"Exported validation report: `{report_path.name}`.")
 
 
 def make_session(project_name: str, output_filename: str, model_name: str, full_text: str, chunks: list[str]) -> dict[str, Any]:
@@ -680,6 +732,7 @@ def generate_all_chunks(
     norm_loudness,
     enable_parallel,
     max_parallel_devices,
+    progress=gr.Progress(track_tqdm=True),
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
@@ -705,11 +758,12 @@ def generate_all_chunks(
 
     if len(devices) == 1:
         model_cache, adapter = get_model_adapter(model_cache, model_name, devices[0])
-        for chunk in chunks_to_generate:
+        for chunk_index, chunk in enumerate(chunks_to_generate, start=1):
             try:
                 wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
                 last_audio = save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
                 save_session(session)
+                progress(chunk_index / len(chunks_to_generate), desc=f"Generated chunk {chunk_index}/{len(chunks_to_generate)}")
             except Exception as exc:
                 chunk["status"] = "failed"
                 chunk["error"] = str(exc)
@@ -745,12 +799,15 @@ def generate_all_chunks(
             future_to_chunk[future] = chunk
 
         first_error = None
+        completed = 0
         for future in as_completed(future_to_chunk):
             chunk = future_to_chunk[future]
+            completed += 1
             try:
                 wav, sr, device = future.result()
                 last_audio = save_chunk_audio(session, chunk, wav, sr, model_name, device)
                 save_session(session)
+                progress(completed / len(chunks_to_generate), desc=f"Generated {completed}/{len(chunks_to_generate)} chunks")
             except Exception as exc:
                 first_error = exc
                 chunk["status"] = "failed"
@@ -1032,14 +1089,14 @@ def check_audio_selected(session, chunk_number, silence_threshold_db, max_silenc
     )
 
 
-def check_audio_all(session, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs):
+def check_audio_all(session, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs, progress=gr.Progress(track_tqdm=True)):
     if not session:
         raise gr.Error("Create or load a session first.")
     chunks = [chunk for chunk in session["chunks"] if chunk.get("audio_path") and chunk["status"] != "excluded"]
     if not chunks:
         raise gr.Error("Generate at least one chunk before checking audio quality.")
     passed = 0
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
         try:
             result = check_audio_quality(session, chunk, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs)
             passed += int(result["passed"])
@@ -1047,6 +1104,7 @@ def check_audio_all(session, silence_threshold_db, max_silence_ms, max_clip_frac
             chunk["audio_quality_status"] = "error"
             chunk["audio_quality_error"] = str(exc)
         save_session(session)
+        progress(chunk_index / len(chunks), desc=f"Checked audio {chunk_index}/{len(chunks)}")
     return session, format_chunk_table(session), status_message(session, f"Checked audio for {len(chunks)} chunk(s): {passed} passed, {len(chunks) - passed} need review.")
 
 
@@ -1071,7 +1129,7 @@ def validate_selected_chunk(session, chunk_number, whisper_model_name, whisper_d
     )
 
 
-def validate_all_chunks(session, whisper_model_name, whisper_device, validation_threshold, enabled):
+def validate_all_chunks(session, whisper_model_name, whisper_device, validation_threshold, enabled, progress=gr.Progress(track_tqdm=True)):
     if not session:
         raise gr.Error("Create or load a session first.")
     ensure_validation_enabled(enabled)
@@ -1081,11 +1139,12 @@ def validate_all_chunks(session, whisper_model_name, whisper_device, validation_
 
     passed = 0
     first_error = None
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks, start=1):
         try:
             result = validate_chunk(session, chunk, whisper_model_name, whisper_device, float(validation_threshold))
             passed += int(result["passed"])
             save_session(session)
+            progress(chunk_index / len(chunks), desc=f"Validated chunk {chunk_index}/{len(chunks)}")
         except Exception as exc:
             first_error = exc
             chunk["validation_status"] = "error"
@@ -1168,7 +1227,7 @@ def approve_selected_chunk(session, chunk_number):
     return session, format_chunk_table(session), status_message(session, f"Approved chunk {chunk['index']}.")
 
 
-def merge_chunks(session, output_filename, silence_ms, require_approved):
+def merge_chunks(session, output_filename, silence_ms, require_approved, export_mp3, mp3_bitrate):
     if not session:
         raise gr.Error("Create or load a session first.")
     if ta is None:
@@ -1210,13 +1269,30 @@ def merge_chunks(session, output_filename, silence_ms, require_approved):
     final_path = session_dir(session) / "final" / filename
     ta.save(str(final_path), final_wav, sr)
     session["final_output_path"] = str(final_path)
+    mp3_path = None
+    if export_mp3:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            raise gr.Error("MP3 export requires ffmpeg. Disable MP3 export or install ffmpeg in the Kaggle runtime.")
+        mp3_path = session_dir(session) / "final" / f"{Path(filename).stem}.mp3"
+        try:
+            subprocess.run(
+                [ffmpeg_path, "-y", "-i", str(final_path), "-codec:a", "libmp3lame", "-b:a", str(mp3_bitrate), str(mp3_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or "").strip().splitlines()[-1:] or ["unknown ffmpeg error"]
+            raise gr.Error(f"MP3 export failed: {detail[0]}") from exc
+        session["final_mp3_path"] = str(mp3_path)
     save_session(session)
-    return session, str(final_path), (sr, final_wav.squeeze(0).numpy()), status_message(session, f"Finalized `{filename}`.")
+    return session, str(final_path), (sr, final_wav.squeeze(0).numpy()), str(mp3_path) if mp3_path else None, status_message(session, f"Finalized `{filename}`.")
 
 
 with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     gr.Markdown("# ⚡ Chatterbox Narration Suite")
-    gr.Markdown("Phase 3 build: long-script chunking, session persistence, model selection, dual-GPU batch generation, Whisper validation, per-chunk regeneration, and final merge.")
+    gr.Markdown("Phase 5 build: long-script chunking, resumable sessions, model selection, dual-GPU batch generation, optional Whisper/audio validation, presets, and final merge.")
 
     session_state = gr.State(None)
     model_cache_state = gr.State({})
@@ -1228,8 +1304,15 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                 output_filename = gr.Textbox(value="narration.wav", label="Result file name")
                 model_name = gr.Dropdown(MODEL_CHOICES, value=MODEL_TURBO, label="Model")
                 session_path = gr.Textbox(label="Load existing session directory or session.json path", placeholder="outputs/chatterbox_sessions/...")
+                session_picker = gr.Dropdown(
+                    choices=list_session_paths(),
+                    label="Saved sessions",
+                    info="Select a previous session, then load it.",
+                )
                 with gr.Row():
                     load_session_btn = gr.Button("Load Session")
+                    refresh_sessions_btn = gr.Button("Refresh Sessions")
+                load_picked_session_btn = gr.Button("Load Selected Saved Session")
 
             text = gr.Textbox(
                 value="Oh, that's hilarious! [chuckle] Um anyway, we do have a new model in store. It's the SkyNet T-800 series and it's got basically everything. Including AI integration with ChatGPT and um all that jazz. Would you like me to get some prices for you?",
@@ -1256,6 +1339,8 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
 
         with gr.Column(scale=1):
             with gr.Accordion("Generation Options", open=True):
+                preset_name = gr.Dropdown(PRESET_CHOICES, value="Custom", label="Narration preset")
+                apply_preset_btn = gr.Button("Apply Preset")
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 temp = gr.Slider(0.05, 2.0, step=.05, label="Temperature", value=0.8)
                 top_p = gr.Slider(0.00, 1.00, step=0.01, label="Top P", value=0.95)
@@ -1337,9 +1422,14 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
         with gr.Row():
             silence_ms = gr.Slider(0, 1000, step=25, value=200, label="Silence between chunks (ms)")
             require_approved = gr.Checkbox(value=False, label="Require all chunks approved")
+            export_mp3 = gr.Checkbox(value=False, label="Also export MP3")
+            mp3_bitrate = gr.Dropdown(["128k", "192k", "256k", "320k"], value="192k", label="MP3 bitrate")
         merge_btn = gr.Button("Merge / Finalize", variant="primary")
         final_audio = gr.Audio(label="Final narration")
         final_file = gr.File(label="Download final WAV")
+        final_mp3_file = gr.File(label="Download final MP3")
+        export_report_btn = gr.Button("Export Validation Report")
+        validation_report_file = gr.File(label="Validation report JSON")
 
     split_btn.click(
         fn=create_session,
@@ -1351,6 +1441,23 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
         fn=load_session,
         inputs=[session_path],
         outputs=[session_state, chunk_table, chunk_number, chunk_editor, text, project_name, output_filename, model_name, status],
+    )
+
+    refresh_sessions_btn.click(
+        fn=refresh_session_picker,
+        outputs=[session_picker],
+    )
+
+    load_picked_session_btn.click(
+        fn=load_session,
+        inputs=[session_picker],
+        outputs=[session_state, chunk_table, chunk_number, chunk_editor, text, project_name, output_filename, model_name, status],
+    )
+
+    apply_preset_btn.click(
+        fn=apply_generation_preset,
+        inputs=[preset_name],
+        outputs=[temp, top_p, top_k, repetition_penalty, min_p, exaggeration, cfg_weight, norm_loudness],
     )
 
     load_chunk_btn.click(
@@ -1493,8 +1600,14 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
 
     merge_btn.click(
         fn=merge_chunks,
-        inputs=[session_state, output_filename, silence_ms, require_approved],
-        outputs=[session_state, final_file, final_audio, status],
+        inputs=[session_state, output_filename, silence_ms, require_approved, export_mp3, mp3_bitrate],
+        outputs=[session_state, final_file, final_audio, final_mp3_file, status],
+    )
+
+    export_report_btn.click(
+        fn=export_validation_report,
+        inputs=[session_state],
+        outputs=[validation_report_file, status],
     )
 
 

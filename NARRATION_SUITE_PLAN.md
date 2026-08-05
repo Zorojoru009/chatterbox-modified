@@ -499,6 +499,19 @@ Implement:
 - better progress display
 - settings presets for narration styles
 
+Initial implementation status:
+
+- Added saved-session discovery and a refreshable session picker.
+- Added one-click loading for previously saved sessions.
+- Added generation presets for warm, neutral, and energetic narration.
+- Added downloadable JSON validation reports with per-chunk summaries.
+- Added optional MP3 export through ffmpeg during finalization.
+- Added live progress updates for batch generation and validation operations.
+
+Remaining polish candidates:
+
+- project metadata and settings presets stored directly in the session manifest
+
 ## Engineering risks and notes
 
 - Long text must never be passed directly to Turbo generation.
@@ -527,4 +540,3 @@ After that, add:
 
 - T4 x2 parallel generation
 - Whisper validation
-- voice consistency validation

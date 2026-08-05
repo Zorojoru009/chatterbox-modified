@@ -335,20 +335,11 @@ Important:
 - Whisper should not run at the same time as both TTS workers if VRAM becomes tight.
 - If VRAM pressure is high, use one GPU for validation after generation batches, or use a smaller ASR model.
 
-### 6. Voice consistency validation
+### 6. Audio quality validation
 
-Whisper validates text content, not voice identity.
+Speaker-identity validation is intentionally out of scope for this suite. Chatterbox already uses its own voice conditioning during generation, and an additional speaker-similarity score would add complexity without being necessary for the current YouTube narration workflow.
 
-Recommended voice validation:
-
-- Compute reference speaker embedding once.
-- Compute generated chunk speaker embedding.
-- Compare cosine similarity.
-- Flag chunks below a threshold.
-
-The repo already includes a voice encoder used by Chatterbox. If feasible, reuse it rather than adding a second speaker-verification dependency.
-
-Also validate:
+The audio-quality validator should check:
 
 - silence at start/end
 - clipping
@@ -482,15 +473,20 @@ pip install faster-whisper
 
 Use `small.en` on a T4 when quality is more important, or `base.en`/`tiny.en` when VRAM or runtime is constrained. Keep Whisper on one GPU and run validation after TTS generation if loading both models causes CUDA out-of-memory errors.
 
-### Phase 4: voice/audio validation
+### Phase 4: audio quality validation
 
 Implement:
 
-- reference voice embedding
-- generated chunk embedding
-- cosine similarity scoring
 - silence/clipping/loudness/duration checks
 - review UI details
+
+Initial implementation status:
+
+- Added optional selected-chunk and all-chunk audio checks using `torchaudio` and NumPy.
+- Added leading/trailing silence, clipping, duration, peak, RMS, and near-silent detection.
+- Added configurable thresholds for each check.
+- Added per-chunk audio quality status and combined validation reports under `validation/{chunk_id}.json`.
+- Added audio-quality review details to the chunk table and selected-chunk panel.
 
 ### Phase 5: polish
 

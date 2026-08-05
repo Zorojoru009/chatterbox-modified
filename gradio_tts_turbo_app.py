@@ -166,6 +166,9 @@ def make_session(project_name: str, output_filename: str, model_name: str, full_
                 "validation_status": None,
                 "validation_error": None,
                 "validation_path": None,
+                "audio_quality_status": None,
+                "audio_quality_score": None,
+                "audio_quality_error": None,
                 "error": None,
                 "model_name": None,
                 "device": None,
@@ -287,6 +290,7 @@ def format_chunk_table(session: dict[str, Any] | None) -> list[list[Any]]:
                 chunk.get("device") or "",
                 f"{chunk['text_score']:.3f}" if chunk.get("text_score") is not None else "",
                 chunk.get("validation_status") or "",
+                chunk.get("audio_quality_status") or "",
                 preview,
                 chunk.get("audio_path") or "",
                 chunk.get("transcript") or chunk.get("validation_error") or chunk.get("error") or "",
@@ -478,6 +482,9 @@ def save_selected_chunk(session, chunk_number, edited_text):
     chunk["validation_status"] = None
     chunk["validation_error"] = None
     chunk["validation_path"] = None
+    chunk["audio_quality_status"] = None
+    chunk["audio_quality_score"] = None
+    chunk["audio_quality_error"] = None
     chunk["error"] = None
     chunk["model_name"] = None
     chunk["device"] = None
@@ -542,6 +549,9 @@ def generate_one_chunk(
     chunk["validation_status"] = None
     chunk["validation_error"] = None
     chunk["validation_path"] = None
+    chunk["audio_quality_status"] = None
+    chunk["audio_quality_score"] = None
+    chunk["audio_quality_error"] = None
     chunk["error"] = None
     save_session(session)
 
@@ -647,6 +657,9 @@ def save_chunk_audio(session: dict[str, Any], chunk: dict[str, Any], wav: torch.
     chunk["validation_status"] = None
     chunk["validation_error"] = None
     chunk["validation_path"] = None
+    chunk["audio_quality_status"] = None
+    chunk["audio_quality_score"] = None
+    chunk["audio_quality_error"] = None
     chunk["error"] = None
     return str(audio_path)
 
@@ -875,11 +888,7 @@ def validate_chunk(
         "transcript": transcript,
         **comparison,
     }
-    path = validation_path(session, chunk)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(".tmp.json")
-    temp_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    temp_path.replace(path)
+    write_validation_report(session, chunk, "whisper", result)
 
     chunk["transcript"] = transcript
     chunk["text_score"] = comparison["score"]
@@ -888,7 +897,6 @@ def validate_chunk(
         f"Missing: {', '.join(comparison['missing_words']) or 'none'}; "
         f"Extra: {', '.join(comparison['extra_words']) or 'none'}"
     )
-    chunk["validation_path"] = str(path)
     # A new validation result supersedes a previous approval.
     chunk["status"] = "validated" if comparison["passed"] else "needs_review"
     return result
@@ -897,14 +905,149 @@ def validate_chunk(
 def validation_details(chunk: dict[str, Any] | None) -> str:
     if not chunk:
         return "No chunk selected."
-    if not chunk.get("validation_status"):
-        return "This chunk has not been validated yet."
+    sections = []
+    if chunk.get("validation_status"):
+        sections.append(
+            f"**Whisper:** `{chunk['validation_status']}`  \n"
+            f"**Text score:** `{chunk.get('text_score', 0):.3f}`  \n"
+            f"**Transcript:** {chunk.get('transcript') or '(empty)'}  \n"
+            f"**Details:** {chunk.get('validation_error') or 'No missing or extra words detected.'}"
+        )
+    if chunk.get("audio_quality_status"):
+        sections.append(
+            f"**Audio quality:** `{chunk['audio_quality_status']}`  \n"
+            f"**Details:** {chunk.get('audio_quality_error') or 'No audio quality issues detected.'}"
+        )
+    return "\n\n".join(sections) or "This chunk has not been validated yet."
+
+
+def write_validation_report(session: dict[str, Any], chunk: dict[str, Any], section: str, payload: dict[str, Any]):
+    path = validation_path(session, chunk)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {}
+    if path.exists():
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            report = {}
+    report.setdefault("chunk_index", chunk["index"])
+    report[section] = payload
+    temp_path = path.with_suffix(".tmp.json")
+    temp_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
+    chunk["validation_path"] = str(path)
+
+
+def audio_quality_details(chunk: dict[str, Any] | None) -> str:
+    if not chunk or not chunk.get("audio_quality_status"):
+        return "Audio quality has not been checked yet."
     return (
-        f"**Validation:** `{chunk['validation_status']}`  \n"
-        f"**Text score:** `{chunk.get('text_score', 0):.3f}`  \n"
-        f"**Transcript:** {chunk.get('transcript') or '(empty)'}  \n"
-        f"**Details:** {chunk.get('validation_error') or 'No missing or extra words detected.'}"
+        f"**Audio quality:** `{chunk['audio_quality_status']}`  \n"
+        f"**Details:** {chunk.get('audio_quality_error') or 'No audio quality issues detected.'}"
     )
+
+
+def check_audio_quality(
+    session: dict[str, Any],
+    chunk: dict[str, Any],
+    silence_threshold_db: float,
+    max_silence_ms: float,
+    max_clip_fraction: float,
+    min_duration_s: float,
+    max_duration_s: float,
+    min_rms_dbfs: float,
+) -> dict[str, Any]:
+    if ta is None:
+        raise gr.Error("torchaudio is required for audio quality checks.")
+    audio_path = chunk.get("audio_path")
+    if not audio_path or not Path(audio_path).exists():
+        raise gr.Error("Generate the chunk audio before checking its quality.")
+
+    wav, sample_rate = ta.load(audio_path)
+    samples = wav.float().numpy()
+    mono = samples.mean(axis=0) if samples.ndim == 2 else samples
+    duration_s = float(len(mono) / sample_rate) if sample_rate else 0.0
+    peak = float(np.max(np.abs(mono))) if len(mono) else 0.0
+    rms = float(np.sqrt(np.mean(np.square(mono)))) if len(mono) else 0.0
+    peak_dbfs = 20.0 * np.log10(max(peak, 1e-8))
+    rms_dbfs = 20.0 * np.log10(max(rms, 1e-8))
+    silence_amplitude = 10.0 ** (float(silence_threshold_db) / 20.0)
+    audible = np.abs(mono) > silence_amplitude
+    if audible.any():
+        first_audible = int(np.argmax(audible))
+        last_audible = int(len(audible) - 1 - np.argmax(audible[::-1]))
+        leading_silence_ms = first_audible / sample_rate * 1000.0
+        trailing_silence_ms = (len(audible) - 1 - last_audible) / sample_rate * 1000.0
+    else:
+        leading_silence_ms = duration_s * 1000.0
+        trailing_silence_ms = duration_s * 1000.0
+
+    clip_fraction = float(np.mean(np.abs(mono) >= 0.999)) if len(mono) else 1.0
+    issues: list[str] = []
+    if duration_s < float(min_duration_s):
+        issues.append(f"duration too short ({duration_s:.2f}s)")
+    if duration_s > float(max_duration_s):
+        issues.append(f"duration too long ({duration_s:.2f}s)")
+    if peak < 1e-5 or not audible.any():
+        issues.append("near-silent audio")
+    if rms_dbfs < float(min_rms_dbfs) and audible.any():
+        issues.append(f"low loudness RMS {rms_dbfs:.1f}dBFS")
+    if leading_silence_ms > float(max_silence_ms):
+        issues.append(f"leading silence {leading_silence_ms:.0f}ms")
+    if trailing_silence_ms > float(max_silence_ms):
+        issues.append(f"trailing silence {trailing_silence_ms:.0f}ms")
+    if clip_fraction > float(max_clip_fraction):
+        issues.append(f"clipping fraction {clip_fraction:.5f}")
+
+    score = max(0.0, 1.0 - min(1.0, len(issues) / 5.0))
+    result = {
+        "sample_rate": int(sample_rate),
+        "duration_s": round(duration_s, 4),
+        "peak_dbfs": round(peak_dbfs, 3),
+        "rms_dbfs": round(rms_dbfs, 3),
+        "leading_silence_ms": round(leading_silence_ms, 2),
+        "trailing_silence_ms": round(trailing_silence_ms, 2),
+        "clip_fraction": round(clip_fraction, 6),
+        "silence_threshold_db": float(silence_threshold_db),
+        "max_silence_ms": float(max_silence_ms),
+        "min_rms_dbfs": float(min_rms_dbfs),
+        "passed": not issues,
+        "issues": issues,
+    }
+    chunk["audio_quality_status"] = "passed" if result["passed"] else "needs_review"
+    chunk["audio_quality_score"] = round(score, 4)
+    chunk["audio_quality_error"] = "; ".join(issues) if issues else None
+    write_validation_report(session, chunk, "audio_quality", result)
+    return result
+
+
+def check_audio_selected(session, chunk_number, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    chunk = get_chunk(session, int(chunk_number or 1))
+    result = check_audio_quality(session, chunk, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs)
+    save_session(session)
+    return session, format_chunk_table(session), audio_quality_details(chunk), status_message(
+        session, f"Checked audio for chunk {chunk['index']}: {'passed' if result['passed'] else 'needs review'}."
+    )
+
+
+def check_audio_all(session, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    chunks = [chunk for chunk in session["chunks"] if chunk.get("audio_path") and chunk["status"] != "excluded"]
+    if not chunks:
+        raise gr.Error("Generate at least one chunk before checking audio quality.")
+    passed = 0
+    for chunk in chunks:
+        try:
+            result = check_audio_quality(session, chunk, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs)
+            passed += int(result["passed"])
+        except Exception as exc:
+            chunk["audio_quality_status"] = "error"
+            chunk["audio_quality_error"] = str(exc)
+        save_session(session)
+    return session, format_chunk_table(session), status_message(session, f"Checked audio for {len(chunks)} chunk(s): {passed} passed, {len(chunks) - passed} need review.")
 
 
 def ensure_validation_enabled(enabled: bool):
@@ -1153,11 +1296,22 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                     validate_all_btn = gr.Button("Validate All")
                 regenerate_failed_btn = gr.Button("Regenerate Chunks Needing Review")
 
+            with gr.Accordion("Audio Quality Checks (Optional)", open=False):
+                silence_threshold_db = gr.Slider(-60, -20, step=1, value=-45, label="Silence threshold (dBFS)")
+                max_silence_ms = gr.Slider(0, 2000, step=50, value=250, label="Maximum leading/trailing silence (ms)")
+                max_clip_fraction = gr.Slider(0, 0.01, step=0.0005, value=0.001, label="Maximum clipping fraction")
+                min_duration_s = gr.Slider(0.05, 5, step=0.05, value=0.20, label="Minimum chunk duration (s)")
+                max_duration_s = gr.Slider(5, 180, step=1, value=120, label="Maximum chunk duration (s)")
+                min_rms_dbfs = gr.Slider(-60, -10, step=1, value=-38, label="Minimum RMS loudness (dBFS)")
+                with gr.Row():
+                    check_audio_selected_btn = gr.Button("Check Audio Selected")
+                    check_audio_all_btn = gr.Button("Check Audio All")
+
             status = gr.Markdown("No active session.")
 
     chunk_table = gr.Dataframe(
-        headers=["#", "Status", "Chars", "Model", "Device", "Text Score", "Validation", "Text", "Audio Path", "Transcript / Error"],
-        datatype=["number", "str", "number", "str", "str", "str", "str", "str", "str", "str"],
+        headers=["#", "Status", "Chars", "Model", "Device", "Text Score", "Whisper", "Audio", "Text", "Audio Path", "Transcript / Error"],
+        datatype=["number", "str", "number", "str", "str", "str", "str", "str", "str", "str", "str"],
         label="Chunks",
         interactive=False,
     )
@@ -1253,6 +1407,27 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     validate_all_btn.click(
         fn=validate_all_chunks,
         inputs=[session_state, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
+        outputs=[session_state, chunk_table, status],
+    )
+
+    check_audio_selected_btn.click(
+        fn=check_audio_selected,
+        inputs=[
+            session_state,
+            chunk_number,
+            silence_threshold_db,
+            max_silence_ms,
+            max_clip_fraction,
+            min_duration_s,
+            max_duration_s,
+            min_rms_dbfs,
+        ],
+        outputs=[session_state, chunk_table, chunk_validation, status],
+    )
+
+    check_audio_all_btn.click(
+        fn=check_audio_all,
+        inputs=[session_state, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs],
         outputs=[session_state, chunk_table, status],
     )
 

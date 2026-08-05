@@ -2,7 +2,9 @@ import json
 import random
 import re
 import shutil
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,8 @@ MODEL_TURBO = "Turbo"
 MODEL_NANO = "Nano"
 MODEL_ORIGINAL = "Original"
 MODEL_CHOICES = [MODEL_TURBO, MODEL_NANO, MODEL_ORIGINAL]
+MODEL_ADAPTERS: dict[str, "ModelAdapter"] = {}
+MODEL_ADAPTERS_LOCK = threading.Lock()
 
 EVENT_TAGS = [
     "[clear throat]", "[sigh]", "[shush]", "[cough]", "[groan]",
@@ -152,6 +156,7 @@ def make_session(project_name: str, output_filename: str, model_name: str, full_
                 "voice_score": None,
                 "error": None,
                 "model_name": None,
+                "device": None,
             }
         )
     session = {
@@ -267,6 +272,7 @@ def format_chunk_table(session: dict[str, Any] | None) -> list[list[Any]]:
                 chunk["status"],
                 len(chunk["text"]),
                 chunk.get("model_name") or "",
+                chunk.get("device") or "",
                 preview,
                 chunk.get("audio_path") or "",
                 chunk.get("error") or "",
@@ -323,6 +329,7 @@ class ModelAdapter:
     def __init__(self, model_name: str, device: str):
         self.model_name = model_name
         self.device = device
+        self.lock = threading.Lock()
         if model_name == MODEL_NANO:
             print(f"Loading Chatterbox Nano on {device}...")
             self.model = ChatterboxTurboTTS.from_pretrained(device, nano=True)
@@ -350,35 +357,62 @@ class ModelAdapter:
         cfg_weight: float,
         norm_loudness: bool,
     ) -> torch.Tensor:
-        if self.model_name == MODEL_ORIGINAL:
+        with self.lock:
+            if self.model_name == MODEL_ORIGINAL:
+                return self.model.generate(
+                    text,
+                    audio_prompt_path=audio_prompt_path,
+                    exaggeration=exaggeration,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    min_p=min_p,
+                    top_p=top_p,
+                    repetition_penalty=repetition_penalty,
+                )
+
             return self.model.generate(
                 text,
                 audio_prompt_path=audio_prompt_path,
-                exaggeration=exaggeration,
                 temperature=temperature,
-                cfg_weight=cfg_weight,
-                min_p=min_p,
                 top_p=top_p,
+                top_k=int(top_k),
                 repetition_penalty=repetition_penalty,
+                norm_loudness=norm_loudness,
             )
 
-        return self.model.generate(
-            text,
-            audio_prompt_path=audio_prompt_path,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=int(top_k),
-            repetition_penalty=repetition_penalty,
-            norm_loudness=norm_loudness,
-        )
+
+def default_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
 
 
-def get_model_adapter(model_cache: dict[str, Any] | None, model_name: str) -> tuple[dict[str, Any], ModelAdapter]:
+def available_generation_devices(enable_parallel: bool, max_parallel_devices: int) -> list[str]:
+    if not torch.cuda.is_available():
+        return ["cpu"]
+
+    gpu_count = torch.cuda.device_count()
+    if enable_parallel and gpu_count > 1:
+        limit = max(1, min(int(max_parallel_devices or gpu_count), gpu_count))
+        return [f"cuda:{idx}" for idx in range(limit)]
+
+    return [default_device()]
+
+
+def get_model_adapter(model_cache: dict[str, Any] | None, model_name: str, device: str | None = None) -> tuple[dict[str, Any], ModelAdapter]:
+    """Return a cached adapter.
+
+    The Gradio state argument is kept for callback compatibility, but model
+    objects live in a process-global cache. Heavy torch modules should not be
+    pushed through Gradio session state.
+    """
     cache = model_cache or {}
-    cache_key = f"{model_name}:{DEVICE}"
-    if cache_key not in cache:
-        cache[cache_key] = ModelAdapter(model_name, DEVICE)
-    return cache, cache[cache_key]
+    selected_device = device or default_device()
+    cache_key = f"{model_name}:{selected_device}"
+    with MODEL_ADAPTERS_LOCK:
+        if cache_key not in MODEL_ADAPTERS:
+            MODEL_ADAPTERS[cache_key] = ModelAdapter(model_name, selected_device)
+    return cache, MODEL_ADAPTERS[cache_key]
 
 
 def create_session(project_name, output_filename, model_name, full_text, target_chars):
@@ -423,6 +457,7 @@ def save_selected_chunk(session, chunk_number, edited_text):
     chunk["voice_score"] = None
     chunk["error"] = None
     chunk["model_name"] = None
+    chunk["device"] = None
     text_path = session_dir(session) / "chunks" / f"{chunk['index']:04d}.txt"
     text_path.write_text(chunk["text"], encoding="utf-8")
     save_session(session)
@@ -528,6 +563,46 @@ def collect_generation_settings(temperature, seed_num, min_p, top_p, top_k, repe
     }
 
 
+def generate_chunk_wav(
+    adapter: ModelAdapter,
+    chunk_text: str,
+    chunk_index: int,
+    reference_audio_path: str | None,
+    settings: dict[str, Any],
+) -> tuple[torch.Tensor, int, str]:
+    seed_num = int(settings.get("seed_num") or 0)
+    if seed_num:
+        set_seed(seed_num + int(chunk_index))
+
+    wav = adapter.generate(
+        chunk_text,
+        audio_prompt_path=reference_audio_path,
+        temperature=float(settings["temperature"]),
+        min_p=float(settings["min_p"]),
+        top_p=float(settings["top_p"]),
+        top_k=int(settings["top_k"]),
+        repetition_penalty=float(settings["repetition_penalty"]),
+        exaggeration=float(settings["exaggeration"]),
+        cfg_weight=float(settings["cfg_weight"]),
+        norm_loudness=bool(settings["norm_loudness"]),
+    )
+    return wav.cpu(), adapter.sr, adapter.device
+
+
+def save_chunk_audio(session: dict[str, Any], chunk: dict[str, Any], wav: torch.Tensor, sr: int, model_name: str, device: str) -> str:
+    if ta is None:
+        raise gr.Error("torchaudio is required to save generated chunks but is not available.")
+
+    audio_path = session_dir(session) / "chunks" / f"{chunk['index']:04d}.wav"
+    ta.save(str(audio_path), wav.cpu(), sr)
+    chunk["status"] = "generated"
+    chunk["audio_path"] = str(audio_path)
+    chunk["model_name"] = model_name
+    chunk["device"] = device
+    chunk["error"] = None
+    return str(audio_path)
+
+
 def generate_all_chunks(
     session,
     model_cache,
@@ -542,33 +617,120 @@ def generate_all_chunks(
     exaggeration,
     cfg_weight,
     norm_loudness,
+    enable_parallel,
+    max_parallel_devices,
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
     session["model_name"] = model_name
-    session["generation_settings"] = collect_generation_settings(
+    settings = collect_generation_settings(
         temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness
     )
+    settings["enable_parallel"] = bool(enable_parallel)
+    settings["max_parallel_devices"] = int(max_parallel_devices or 1)
+    session["generation_settings"] = settings
     reference_audio_path = copy_reference_to_session(session, reference_audio_path)
-    model_cache, adapter = get_model_adapter(model_cache, model_name)
 
+    chunks_to_generate = [chunk for chunk in session["chunks"] if chunk["status"] != "excluded"]
+    if not chunks_to_generate:
+        return session, model_cache or {}, format_chunk_table(session), None, status_message(session, "No non-excluded chunks to generate.")
+
+    devices = available_generation_devices(bool(enable_parallel), int(max_parallel_devices or 1))
     last_audio = None
-    for chunk in session["chunks"]:
-        if chunk["status"] == "excluded":
-            continue
-        try:
-            generate_one_chunk(
-                session, adapter, chunk, reference_audio_path, temperature, int(seed_num or 0),
-                min_p, top_p, int(top_k), repetition_penalty, exaggeration, cfg_weight, norm_loudness
-            )
-            last_audio = chunk.get("audio_path")
-        except Exception as exc:
-            chunk["status"] = "failed"
-            chunk["error"] = str(exc)
-            save_session(session)
-            break
+    for chunk in chunks_to_generate:
+        chunk["status"] = "generating"
+        chunk["error"] = None
+    save_session(session)
 
-    return session, model_cache, format_chunk_table(session), last_audio, status_message(session, "Batch generation finished.")
+    if len(devices) == 1:
+        model_cache, adapter = get_model_adapter(model_cache, model_name, devices[0])
+        for chunk in chunks_to_generate:
+            try:
+                wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
+                last_audio = save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
+                save_session(session)
+            except Exception as exc:
+                chunk["status"] = "failed"
+                chunk["error"] = str(exc)
+                save_session(session)
+                break
+
+        return (
+            session,
+            model_cache,
+            format_chunk_table(session),
+            last_audio,
+            status_message(session, f"Batch generation finished on {devices[0]}."),
+        )
+
+    adapters: list[ModelAdapter] = []
+    for device in devices:
+        model_cache, adapter = get_model_adapter(model_cache, model_name, device)
+        adapters.append(adapter)
+
+    future_to_chunk = {}
+    max_workers = len(adapters)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for job_index, chunk in enumerate(chunks_to_generate):
+            adapter = adapters[job_index % len(adapters)]
+            future = executor.submit(
+                generate_chunk_wav,
+                adapter,
+                chunk["text"],
+                chunk["index"],
+                reference_audio_path,
+                settings,
+            )
+            future_to_chunk[future] = chunk
+
+        first_error = None
+        for future in as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                wav, sr, device = future.result()
+                last_audio = save_chunk_audio(session, chunk, wav, sr, model_name, device)
+                save_session(session)
+            except Exception as exc:
+                first_error = exc
+                chunk["status"] = "failed"
+                chunk["error"] = str(exc)
+                save_session(session)
+
+    if first_error is not None:
+        for chunk in chunks_to_generate:
+            if chunk["status"] == "generating":
+                chunk["status"] = "failed"
+                chunk["error"] = "Generation did not complete."
+        save_session(session)
+        return (
+            session,
+            model_cache,
+            format_chunk_table(session),
+            last_audio,
+            status_message(session, f"Batch generation stopped after an error: {first_error}"),
+        )
+
+    return (
+        session,
+        model_cache,
+        format_chunk_table(session),
+        last_audio,
+        status_message(session, f"Parallel batch generation finished across {len(devices)} device(s): {', '.join(devices)}."),
+    )
+
+
+def gpu_status_text(enable_parallel, max_parallel_devices):
+    devices = available_generation_devices(bool(enable_parallel), int(max_parallel_devices or 1))
+    if torch.cuda.is_available():
+        return f"Detected {torch.cuda.device_count()} CUDA device(s). Batch generation will use: `{', '.join(devices)}`."
+    return "CUDA is not available. Batch generation will use CPU."
+
+
+def warm_model_cache(model_cache, model_name, enable_parallel, max_parallel_devices):
+    devices = available_generation_devices(bool(enable_parallel), int(max_parallel_devices or 1))
+    for device in devices:
+        model_cache, _adapter = get_model_adapter(model_cache, model_name, device)
+    return model_cache, f"Loaded `{model_name}` on: `{', '.join(devices)}`."
 
 
 def exclude_selected_chunk(session, chunk_number):
@@ -635,7 +797,7 @@ def merge_chunks(session, output_filename, silence_ms, require_approved):
 
 with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     gr.Markdown("# ⚡ Chatterbox Narration Suite")
-    gr.Markdown("Phase 1 build: long-script chunking, session persistence, model selection, per-chunk regeneration, and final merge.")
+    gr.Markdown("Phase 2 build: long-script chunking, session persistence, model selection, per-chunk regeneration, dual-GPU batch generation, and final merge.")
 
     session_state = gr.State(None)
     model_cache_state = gr.State({})
@@ -685,11 +847,19 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                 cfg_weight = gr.Slider(0.0, 1.0, step=.05, label="CFG/Pace (Original only)", value=0.5)
                 norm_loudness = gr.Checkbox(value=True, label="Normalize reference loudness (Turbo/Nano)")
 
+            with gr.Accordion("GPU / Batch Processing", open=True):
+                enable_parallel = gr.Checkbox(value=True, label="Use multiple CUDA GPUs for Generate All when available")
+                max_parallel_devices = gr.Slider(1, 8, step=1, value=2, label="Max GPU workers")
+                gpu_status = gr.Markdown(gpu_status_text(True, 2))
+                with gr.Row():
+                    refresh_gpu_btn = gr.Button("Refresh GPU Status")
+                    warm_models_btn = gr.Button("Load Selected Model on Batch Devices")
+
             status = gr.Markdown("No active session.")
 
     chunk_table = gr.Dataframe(
-        headers=["#", "Status", "Chars", "Model", "Text", "Audio Path", "Error"],
-        datatype=["number", "str", "number", "str", "str", "str", "str"],
+        headers=["#", "Status", "Chars", "Model", "Device", "Text", "Audio Path", "Error"],
+        datatype=["number", "str", "number", "str", "str", "str", "str", "str"],
         label="Chunks",
         interactive=False,
     )
@@ -762,6 +932,18 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
         outputs=[session_state, model_cache_state, chunk_table, chunk_audio, status],
     )
 
+    refresh_gpu_btn.click(
+        fn=gpu_status_text,
+        inputs=[enable_parallel, max_parallel_devices],
+        outputs=[gpu_status],
+    )
+
+    warm_models_btn.click(
+        fn=warm_model_cache,
+        inputs=[model_cache_state, model_name, enable_parallel, max_parallel_devices],
+        outputs=[model_cache_state, status],
+    )
+
     generate_all_btn.click(
         fn=generate_all_chunks,
         inputs=[
@@ -778,6 +960,8 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
             exaggeration,
             cfg_weight,
             norm_loudness,
+            enable_parallel,
+            max_parallel_devices,
         ],
         outputs=[session_state, model_cache_state, chunk_table, chunk_audio, status],
     )

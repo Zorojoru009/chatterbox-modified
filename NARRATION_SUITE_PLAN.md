@@ -443,6 +443,15 @@ Implement:
 
 This phase uses Kaggle T4 x2 effectively.
 
+Initial implementation status:
+
+- Added GPU detection through `torch.cuda.device_count()`.
+- Added a process-global model adapter cache keyed by model and device.
+- Added optional multi-GPU batch generation for `Generate All`.
+- Added UI controls for enabling/disabling parallel generation and setting max GPU workers.
+- Added a chunk table `Device` column so Kaggle runs can confirm use of `cuda:0` and `cuda:1`.
+- Kept `Generate Selected` on the primary device for predictable single-chunk edits.
+
 ### Phase 3: Whisper validation
 
 Implement:

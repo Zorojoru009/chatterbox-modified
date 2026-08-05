@@ -534,6 +534,14 @@ def load_selected_chunk(session, chunk_number):
     )
 
 
+def move_selected_chunk(session, chunk_number, direction: int):
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    current = int(chunk_number or 1)
+    next_number = max(1, min(len(session["chunks"]), current + int(direction)))
+    return (next_number, *load_selected_chunk(session, next_number))
+
+
 def save_selected_chunk(session, chunk_number, edited_text):
     chunk = get_chunk(session, int(chunk_number or 1))
     chunk["text"] = edited_text or ""
@@ -743,6 +751,11 @@ def generate_all_chunks(
     norm_loudness,
     enable_parallel,
     max_parallel_devices,
+    validation_enabled=False,
+    auto_regenerate=False,
+    whisper_model_name="small.en",
+    whisper_device="cuda:0",
+    validation_threshold=0.90,
     progress=gr.Progress(track_tqdm=True),
 ):
     if not session:
@@ -781,12 +794,18 @@ def generate_all_chunks(
                 save_session(session)
                 break
 
+        session, model_cache, auto_status = maybe_auto_validate_and_regenerate(
+            session, model_cache, model_name, reference_audio_path, temperature, seed_num,
+            min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness,
+            enable_parallel, max_parallel_devices, validation_enabled, auto_regenerate,
+            whisper_model_name, whisper_device, validation_threshold,
+        )
         return (
             session,
             model_cache,
             format_chunk_table(session),
             last_audio,
-            status_message(session, f"Batch generation finished on {devices[0]}."),
+            status_message(session, f"Batch generation finished on {devices[0]}. {auto_status}"),
         )
 
     adapters: list[ModelAdapter] = []
@@ -839,12 +858,18 @@ def generate_all_chunks(
             status_message(session, f"Batch generation stopped after an error: {first_error}"),
         )
 
+    session, model_cache, auto_status = maybe_auto_validate_and_regenerate(
+        session, model_cache, model_name, reference_audio_path, temperature, seed_num,
+        min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness,
+        enable_parallel, max_parallel_devices, validation_enabled, auto_regenerate,
+        whisper_model_name, whisper_device, validation_threshold,
+    )
     return (
         session,
         model_cache,
         format_chunk_table(session),
         last_audio,
-        status_message(session, f"Parallel batch generation finished across {len(devices)} device(s): {', '.join(devices)}."),
+        status_message(session, f"Parallel batch generation finished across {len(devices)} device(s): {', '.join(devices)}. {auto_status}"),
     )
 
 
@@ -1222,6 +1247,69 @@ def regenerate_failed_chunks(
     return session, model_cache, format_chunk_table(session), status_message(session, f"Regenerated {len(failed)} chunk(s) needing review.")
 
 
+def maybe_auto_validate_and_regenerate(
+    session,
+    model_cache,
+    model_name,
+    reference_audio_path,
+    temperature,
+    seed_num,
+    min_p,
+    top_p,
+    top_k,
+    repetition_penalty,
+    exaggeration,
+    cfg_weight,
+    norm_loudness,
+    enable_parallel,
+    max_parallel_devices,
+    validation_enabled,
+    auto_regenerate,
+    whisper_model_name,
+    whisper_device,
+    validation_threshold,
+):
+    if not validation_enabled or not auto_regenerate:
+        return session, model_cache, ""
+
+    session, _table, validation_status = validate_all_chunks(
+        session,
+        whisper_model_name,
+        whisper_device,
+        validation_threshold,
+        True,
+    )
+    failed = [
+        chunk for chunk in session["chunks"]
+        if chunk.get("validation_status") == "needs_review" and chunk["status"] != "excluded"
+    ]
+    if not failed:
+        return session, model_cache, validation_status
+
+    session, model_cache, _table, regeneration_status = regenerate_failed_chunks(
+        session,
+        model_cache,
+        model_name,
+        reference_audio_path,
+        temperature,
+        seed_num,
+        min_p,
+        top_p,
+        top_k,
+        repetition_penalty,
+        exaggeration,
+        cfg_weight,
+        norm_loudness,
+        enable_parallel,
+        max_parallel_devices,
+        validation_threshold,
+        whisper_model_name,
+        whisper_device,
+        True,
+    )
+    return session, model_cache, f"{validation_status} Automatic regeneration: {regeneration_status}"
+
+
 def exclude_selected_chunk(session, chunk_number):
     chunk = get_chunk(session, int(chunk_number or 1))
     chunk["status"] = "excluded"
@@ -1386,7 +1474,12 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                     value="cuda:0" if torch.cuda.is_available() else "cpu",
                     label="Whisper device",
                 )
-                validation_threshold = gr.Slider(0.50, 0.99, step=0.01, value=0.85, label="Pass score threshold")
+                validation_threshold = gr.Slider(0.50, 0.99, step=0.01, value=0.90, label="Pass score threshold")
+                auto_regenerate = gr.Checkbox(
+                    value=False,
+                    label="Auto-regenerate Generate All chunks below threshold",
+                    info="Requires Whisper validation and retries each failed chunk once.",
+                )
                 with gr.Row():
                     validate_selected_btn = gr.Button("Validate Selected")
                     validate_all_btn = gr.Button("Validate All")
@@ -1415,6 +1508,9 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     with gr.Row():
         with gr.Column():
             chunk_number = gr.Number(value=1, precision=0, label="Selected chunk number")
+            with gr.Row():
+                previous_chunk_btn = gr.Button("← Previous Chunk")
+                next_chunk_btn = gr.Button("Next Chunk →")
             load_chunk_btn = gr.Button("Load Selected Chunk")
             chunk_editor = gr.Textbox(label="Selected chunk text", lines=5)
             save_chunk_btn = gr.Button("Save Edited Chunk")
@@ -1475,6 +1571,18 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
         fn=load_selected_chunk,
         inputs=[session_state, chunk_number],
         outputs=[chunk_editor, chunk_audio, chunk_transcript, chunk_validation, status],
+    )
+
+    previous_chunk_btn.click(
+        fn=lambda session, number: move_selected_chunk(session, number, -1),
+        inputs=[session_state, chunk_number],
+        outputs=[chunk_number, chunk_editor, chunk_audio, chunk_transcript, chunk_validation, status],
+    )
+
+    next_chunk_btn.click(
+        fn=lambda session, number: move_selected_chunk(session, number, 1),
+        inputs=[session_state, chunk_number],
+        outputs=[chunk_number, chunk_editor, chunk_audio, chunk_transcript, chunk_validation, status],
     )
 
     save_chunk_btn.click(
@@ -1593,6 +1701,11 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
             norm_loudness,
             enable_parallel,
             max_parallel_devices,
+            validation_enabled,
+            auto_regenerate,
+            whisper_model_name,
+            whisper_device,
+            validation_threshold,
         ],
         outputs=[session_state, model_cache_state, chunk_table, chunk_audio, status],
     )

@@ -504,6 +504,8 @@ Initial implementation status:
 - Added saved-session discovery and a refreshable session picker.
 - Added one-click loading for previously saved sessions.
 - Added channel-specific presets based on the mechanism-first mental-models editorial identity.
+- Added opt-in automatic Whisper regeneration for `Generate All` chunks scoring below the selected threshold, defaulting to 0.90 with one retry.
+- Added Previous/Next chunk navigation so users do not need to type chunk numbers for normal review.
 - Added downloadable JSON validation reports with per-chunk summaries.
 - Added optional MP3 export through ffmpeg during finalization.
 - Added live progress updates for batch generation and validation operations.

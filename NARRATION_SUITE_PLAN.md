@@ -503,7 +503,7 @@ Initial implementation status:
 
 - Added saved-session discovery and a refreshable session picker.
 - Added one-click loading for previously saved sessions.
-- Added generation presets for warm, neutral, and energetic narration.
+- Added channel-specific presets based on the mechanism-first mental-models editorial identity.
 - Added downloadable JSON validation reports with per-chunk summaries.
 - Added optional MP3 export through ffmpeg during finalization.
 - Added live progress updates for batch generation and validation operations.

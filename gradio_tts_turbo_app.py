@@ -37,12 +37,23 @@ MODEL_TURBO = "Turbo"
 MODEL_NANO = "Nano"
 MODEL_ORIGINAL = "Original"
 MODEL_CHOICES = [MODEL_TURBO, MODEL_NANO, MODEL_ORIGINAL]
-PRESET_CHOICES = ["Custom", "Warm narration", "Neutral narration", "Energetic narration"]
+PRESET_CHOICES = [
+    "Reality Mechanism",
+    "Clear Mental Model",
+    "Investigative Case Study",
+    "Philosophical Reflection",
+    "High-Stakes Decision",
+    "Custom",
+]
 GENERATION_PRESETS = {
+    # Turbo/Nano primarily use temperature, top-p, top-k, repetition penalty,
+    # and loudness normalization. Original also uses the remaining controls.
+    "Reality Mechanism": (0.58, 0.92, 900, 1.18, 0.05, 0.48, 0.58, True),
+    "Clear Mental Model": (0.52, 0.90, 800, 1.16, 0.05, 0.42, 0.62, True),
+    "Investigative Case Study": (0.68, 0.94, 1000, 1.20, 0.05, 0.58, 0.52, True),
+    "Philosophical Reflection": (0.48, 0.88, 700, 1.14, 0.05, 0.62, 0.48, True),
+    "High-Stakes Decision": (0.74, 0.95, 1000, 1.20, 0.05, 0.70, 0.42, True),
     "Custom": (0.8, 0.95, 1000, 1.2, 0.05, 0.5, 0.5, True),
-    "Warm narration": (0.65, 0.92, 1000, 1.15, 0.05, 0.65, 0.45, True),
-    "Neutral narration": (0.55, 0.90, 800, 1.15, 0.05, 0.45, 0.55, True),
-    "Energetic narration": (0.9, 0.96, 1000, 1.2, 0.05, 0.85, 0.35, True),
 }
 MODEL_ADAPTERS: dict[str, "ModelAdapter"] = {}
 MODEL_ADAPTERS_LOCK = threading.Lock()
@@ -1339,7 +1350,7 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
 
         with gr.Column(scale=1):
             with gr.Accordion("Generation Options", open=True):
-                preset_name = gr.Dropdown(PRESET_CHOICES, value="Custom", label="Narration preset")
+                preset_name = gr.Dropdown(PRESET_CHOICES, value="Reality Mechanism", label="Channel narration preset")
                 apply_preset_btn = gr.Button("Apply Preset")
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 temp = gr.Slider(0.05, 2.0, step=.05, label="Temperature", value=0.8)

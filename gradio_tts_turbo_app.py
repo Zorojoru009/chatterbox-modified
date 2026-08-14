@@ -1668,7 +1668,7 @@ def merge_chunks(session, output_filename, silence_ms, require_approved, export_
     return session, str(final_path), (sr, final_wav.squeeze(0).numpy()), str(mp3_path) if mp3_path else None, status_message(session, f"Finalized `{filename}`.")
 
 
-with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
+with gr.Blocks(title="Chatterbox Narration Suite") as demo:
     gr.Markdown("# ⚡ Chatterbox Narration Suite")
     gr.Markdown("Phase 5 build: long-script chunking, resumable sessions, model selection, dual-GPU batch generation, optional Whisper/audio validation, presets, and final merge.")
 
@@ -1811,7 +1811,6 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
             label="Narration blueprint JSON",
             file_types=[".json"],
             type="filepath",
-            info="Upload a narration_blueprint.json produced by the chatterbox-narration-settings skill. Each chunk carries its own model and generation settings.",
         )
         with gr.Row():
             import_blueprint_btn = gr.Button("Import Blueprint JSON", variant="primary")
@@ -2061,4 +2060,5 @@ if __name__ == "__main__":
     ).launch(
         share=True,
         allowed_paths=[str(SESSION_ROOT.resolve())],
+        css=CUSTOM_CSS,
     )

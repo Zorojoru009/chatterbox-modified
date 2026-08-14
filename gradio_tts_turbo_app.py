@@ -539,10 +539,144 @@ def create_session(project_name, output_filename, model_name, full_text, target_
     return session, format_chunk_table(session), 1, chunks[0], status_message(session, "Created.")
 
 
-def load_session(path_value):
-    if not path_value:
-        raise gr.Error("Enter a session directory or session.json path.")
-    session = load_session_from_path(path_value)
+BLUEPRINT_DEFAULT_SETTINGS = {
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "top_k": 1000,
+    "repetition_penalty": 1.2,
+    "min_p": 0.05,
+    "exaggeration": 0.5,
+    "cfg_weight": 0.5,
+    "norm_loudness": True,
+    "seed_num": 0,
+}
+
+
+def normalize_blueprint_settings(settings, model_name=None, base=None):
+    """Return a full generation-settings dict (same shape as collect_generation_settings)
+    from a possibly-partial blueprint `settings` object.
+
+    A per-chunk `settings` object OVERRIDES the `base` (normally the blueprint's
+    `default_settings`) key-by-key; any key the chunk omits inherits from `base`.
+    """
+    normalized = dict(BLUEPRINT_DEFAULT_SETTINGS if base is None else base)
+    if isinstance(settings, dict):
+        for key in normalized:
+            if key in settings and settings[key] is not None:
+                normalized[key] = settings[key]
+    normalized["temperature"] = float(normalized["temperature"])
+    normalized["top_p"] = float(normalized["top_p"])
+    normalized["top_k"] = int(normalized["top_k"])
+    normalized["repetition_penalty"] = float(normalized["repetition_penalty"])
+    normalized["min_p"] = float(normalized["min_p"])
+    normalized["exaggeration"] = float(normalized["exaggeration"])
+    normalized["cfg_weight"] = float(normalized["cfg_weight"])
+    normalized["norm_loudness"] = bool(normalized["norm_loudness"])
+    normalized["seed_num"] = int(normalized["seed_num"] or 0)
+    return normalized
+
+
+def validate_narration_blueprint(blueprint) -> str | None:
+    """Return an error message if the blueprint is invalid, else None."""
+    if not isinstance(blueprint, dict):
+        return "Blueprint must be a JSON object."
+    if blueprint.get("schema_version") not in (1, None):
+        return f"Unsupported schema_version: {blueprint.get('schema_version')!r} (supported: 1)."
+    chunks = blueprint.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return "Blueprint must contain a non-empty `chunks` array."
+    default_model = blueprint.get("default_model", MODEL_TURBO)
+    if default_model not in MODEL_CHOICES:
+        return f"`default_model` must be one of {MODEL_CHOICES}; got `{default_model}`."
+    for index, entry in enumerate(chunks, start=1):
+        if not isinstance(entry, dict):
+            return f"chunks[{index}] must be a JSON object."
+        if not str(entry.get("text") or "").strip():
+            return f"chunks[{index}] is missing non-empty `text`."
+        entry_model = entry.get("model") or default_model
+        if entry_model not in MODEL_CHOICES:
+            return f"chunks[{index}] `model` must be one of {MODEL_CHOICES}; got `{entry_model}`."
+    return None
+
+
+def make_session_from_blueprint(blueprint: dict[str, Any]) -> dict[str, Any]:
+    project = safe_name(blueprint.get("project_name"), fallback="youtube_narration")
+    sid = f"{project}-{uuid.uuid4().hex[:8]}"
+    sdir = SESSION_ROOT / sid
+    default_model = blueprint.get("default_model", MODEL_TURBO)
+    default_settings = normalize_blueprint_settings(blueprint.get("default_settings", {}), default_model)
+    now_chunks = []
+    for index, entry in enumerate(blueprint.get("chunks") or [], start=1):
+        entry_model = entry.get("model") or default_model
+        now_chunks.append(
+            {
+                "index": index,
+                "id": str(entry.get("id") or f"chunk{index:04d}"),
+                "text": str(entry.get("text") or "").strip(),
+                "status": "pending",
+                "audio_path": None,
+                "transcript": None,
+                "text_score": None,
+                "voice_score": None,
+                "validation_status": None,
+                "validation_error": None,
+                "validation_path": None,
+                "audio_quality_status": None,
+                "audio_quality_score": None,
+                "audio_quality_error": None,
+                "error": None,
+                "model_name": entry_model,
+                "device": None,
+                "settings": normalize_blueprint_settings(entry.get("settings", {}), entry_model, base=default_settings),
+                "note": str(entry.get("note") or ""),
+            }
+        )
+    session = {
+        "session_id": sid,
+        "project_name": project,
+        "output_filename": safe_wav_filename(blueprint.get("output_filename") or "narration.wav"),
+        "model_name": default_model,
+        "full_text": "\n\n".join(chunk["text"] for chunk in now_chunks),
+        "reference_audio_path": blueprint.get("reference_audio_path") or None,
+        "generation_settings": default_settings,
+        "allow_mixed_models": bool(blueprint.get("allow_mixed_models", False)),
+        "from_blueprint": True,
+        "chunks": now_chunks,
+        "final_output_path": None,
+        "session_dir": str(sdir),
+    }
+    merge_cfg = blueprint.get("merge") if isinstance(blueprint.get("merge"), dict) else {}
+    session["merge_settings"] = {
+        "silence_ms": float(merge_cfg.get("silence_ms", 200)),
+        "require_approved": bool(merge_cfg.get("require_approved", False)),
+        "export_mp3": bool(merge_cfg.get("export_mp3", False)),
+        "mp3_bitrate": str(merge_cfg.get("mp3_bitrate", "192k")),
+    }
+    (sdir / "chunks").mkdir(parents=True, exist_ok=True)
+    (sdir / "reference").mkdir(parents=True, exist_ok=True)
+    (sdir / "final").mkdir(parents=True, exist_ok=True)
+    for chunk in session["chunks"]:
+        text_path = sdir / "chunks" / f"{chunk['index']:04d}.txt"
+        text_path.write_text(chunk["text"], encoding="utf-8")
+    save_session(session)
+    return session
+
+
+def import_narration_blueprint(file_path):
+    if not file_path:
+        raise gr.Error("Upload a narration blueprint JSON file first.")
+    path = Path(file_path)
+    if not path.exists():
+        raise gr.Error(f"Blueprint file not found: {file_path}")
+    try:
+        blueprint = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise gr.Error(f"Blueprint is not valid JSON: {exc}") from exc
+    problem = validate_narration_blueprint(blueprint)
+    if problem:
+        raise gr.Error(f"Invalid narration blueprint: {problem}")
+    session = make_session_from_blueprint(blueprint)
+    merge = session.get("merge_settings", {})
     first_text = session["chunks"][0]["text"] if session.get("chunks") else ""
     return (
         session,
@@ -553,6 +687,33 @@ def load_session(path_value):
         session.get("project_name", ""),
         session.get("output_filename", "narration.wav"),
         session.get("model_name", MODEL_TURBO),
+        merge.get("silence_ms", 200),
+        merge.get("require_approved", False),
+        merge.get("export_mp3", False),
+        merge.get("mp3_bitrate", "192k"),
+        status_message(session, f"Imported blueprint `{path.name}`."),
+    )
+
+
+def load_session(path_value):
+    if not path_value:
+        raise gr.Error("Enter a session directory or session.json path.")
+    session = load_session_from_path(path_value)
+    first_text = session["chunks"][0]["text"] if session.get("chunks") else ""
+    merge = session.get("merge_settings", {})
+    return (
+        session,
+        format_chunk_table(session),
+        1,
+        first_text,
+        session.get("full_text", ""),
+        session.get("project_name", ""),
+        session.get("output_filename", "narration.wav"),
+        session.get("model_name", MODEL_TURBO),
+        merge.get("silence_ms", 200),
+        merge.get("require_approved", False),
+        merge.get("export_mp3", False),
+        merge.get("mp3_bitrate", "192k"),
         status_message(session, "Loaded."),
     )
 
@@ -911,6 +1072,67 @@ def generate_all_chunks(
         format_chunk_table(session),
         last_audio,
         status_message(session, f"Parallel batch generation finished across {len(devices)} device(s): {', '.join(devices)}. {auto_status}"),
+    )
+
+
+def generate_all_from_blueprint(
+    session,
+    model_cache,
+    reference_audio_path,
+    progress=gr.Progress(track_tqdm=True),
+):
+    """Generate every chunk with ITS OWN model + settings from a blueprint-imported session.
+
+    Unlike generate_all_chunks (one model + one settings tuple for the whole session),
+    each chunk's declared `model_name` and `settings` are honored, so the blueprint
+    direction is preserved exactly. Sequential on the default device for predictability.
+    """
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    if not session.get("from_blueprint"):
+        raise gr.Error("Use this action only for blueprint-imported sessions (Advanced panel). Regular sessions use Generate All.")
+
+    if session.get("reference_audio_path"):
+        reference_audio_path = copy_reference_to_session(session, session.get("reference_audio_path"))
+    else:
+        reference_audio_path = copy_reference_to_session(session, reference_audio_path)
+
+    chunks_to_generate = [chunk for chunk in session["chunks"] if chunk["status"] != "excluded"]
+    if not chunks_to_generate:
+        return session, model_cache or {}, format_chunk_table(session), None, status_message(session, "No non-excluded chunks to generate.")
+
+    for chunk in chunks_to_generate:
+        chunk["status"] = "generating"
+        chunk["error"] = None
+    save_session(session)
+
+    model_cache = model_cache or {}
+    last_audio = None
+    base_settings = normalize_blueprint_settings(session.get("generation_settings") or {}, session.get("model_name"))
+    for chunk_index, chunk in enumerate(chunks_to_generate, start=1):
+        model = chunk.get("model_name") or session.get("model_name") or MODEL_TURBO
+        settings = normalize_blueprint_settings(chunk.get("settings") or {}, model, base=base_settings)
+        progress((chunk_index - 1) / len(chunks_to_generate), desc=f"Loading {model} for chunk {chunk['index']}...")
+        model_cache, adapter = get_model_adapter(model_cache, model, default_device())
+        try:
+            wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
+            last_audio = save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
+            save_session(session)
+            progress(chunk_index / len(chunks_to_generate), desc=f"Generated chunk {chunk_index}/{len(chunks_to_generate)}")
+        except Exception as exc:
+            chunk["status"] = "failed"
+            chunk["error"] = str(exc)
+            save_session(session)
+            return session, model_cache, format_chunk_table(session), last_audio, status_message(
+                session, f"Blueprint generation stopped at chunk {chunk['index']}: {exc}"
+            )
+
+    return (
+        session,
+        model_cache,
+        format_chunk_table(session),
+        last_audio,
+        status_message(session, f"Blueprint generation finished for {len(chunks_to_generate)} chunk(s)."),
     )
 
 
@@ -1383,8 +1605,11 @@ def merge_chunks(session, output_filename, silence_ms, require_approved, export_
         for chunk in session.get("chunks", [])
         if chunk.get("audio_path") and chunk.get("model_name")
     }
-    if len(existing_models) > 1:
-        raise gr.Error(f"Cannot finalize a mixed-model session: {', '.join(sorted(existing_models))}.")
+    if len(existing_models) > 1 and not session.get("allow_mixed_models"):
+        raise gr.Error(
+            f"Cannot finalize a mixed-model session: {', '.join(sorted(existing_models))}. "
+            "Set `allow_mixed_models` to true in the narration blueprint to allow this."
+        )
 
     filename = safe_wav_filename(output_filename or session.get("output_filename"))
     session["output_filename"] = filename
@@ -1581,6 +1806,22 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
                 approve_btn = gr.Button("Approve Selected")
                 exclude_btn = gr.Button("Exclude Selected")
 
+    with gr.Accordion("Advanced (Blueprint JSON)", open=False):
+        blueprint_file = gr.File(
+            label="Narration blueprint JSON",
+            file_types=[".json"],
+            type="filepath",
+            info="Upload a narration_blueprint.json produced by the chatterbox-narration-settings skill. Each chunk carries its own model and generation settings.",
+        )
+        with gr.Row():
+            import_blueprint_btn = gr.Button("Import Blueprint JSON", variant="primary")
+            generate_advanced_btn = gr.Button("Generate All (Blueprint)")
+        advanced_status = gr.Markdown(
+            "Upload a blueprint, **Import** it, then **Generate All (Blueprint)**. "
+            "Each chunk is generated with its own model + settings from the JSON. "
+            "Review / edit / validate / merge exactly like a normal session."
+        )
+
     with gr.Accordion("Finalize", open=True):
         with gr.Row():
             silence_ms = gr.Slider(0, 1000, step=25, value=200, label="Silence between chunks (ms)")
@@ -1603,7 +1844,7 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     load_session_btn.click(
         fn=load_session,
         inputs=[session_path],
-        outputs=[session_state, chunk_table, chunk_number, chunk_editor, text, project_name, output_filename, model_name, status],
+        outputs=[session_state, chunk_table, chunk_number, chunk_editor, text, project_name, output_filename, model_name, silence_ms, require_approved, export_mp3, mp3_bitrate, status],
     )
 
     refresh_sessions_btn.click(
@@ -1614,7 +1855,7 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
     load_picked_session_btn.click(
         fn=load_session,
         inputs=[session_picker],
-        outputs=[session_state, chunk_table, chunk_number, chunk_editor, text, project_name, output_filename, model_name, status],
+        outputs=[session_state, chunk_table, chunk_number, chunk_editor, text, project_name, output_filename, model_name, silence_ms, require_approved, export_mp3, mp3_bitrate, status],
     )
 
     apply_preset_btn.click(
@@ -1794,6 +2035,22 @@ with gr.Blocks(title="Chatterbox Narration Suite", css=CUSTOM_CSS) as demo:
         fn=export_validation_report,
         inputs=[session_state],
         outputs=[validation_report_file, status],
+    )
+
+    import_blueprint_btn.click(
+        fn=import_narration_blueprint,
+        inputs=[blueprint_file],
+        outputs=[
+            session_state, chunk_table, chunk_number, chunk_editor,
+            text, project_name, output_filename, model_name,
+            silence_ms, require_approved, export_mp3, mp3_bitrate, status,
+        ],
+    )
+
+    generate_advanced_btn.click(
+        fn=generate_all_from_blueprint,
+        inputs=[session_state, model_cache_state, ref_wav],
+        outputs=[session_state, model_cache_state, chunk_table, chunk_audio, status],
     )
 
 

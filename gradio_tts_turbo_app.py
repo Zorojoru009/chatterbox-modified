@@ -596,6 +596,13 @@ def validate_narration_blueprint(blueprint) -> str | None:
         entry_model = entry.get("model") or default_model
         if entry_model not in MODEL_CHOICES:
             return f"chunks[{index}] `model` must be one of {MODEL_CHOICES}; got `{entry_model}`."
+        if entry_model != default_model:
+            return (
+                f"chunks[{index}] uses `{entry_model}` but `default_model` is `{default_model}`. "
+                "A blueprint must use a single model for every chunk — mixing models forces "
+                "repeated GPU model load/unload and breaks VRAM. Omit `model` (or set it to the "
+                "default) on every chunk."
+            )
     return None
 
 

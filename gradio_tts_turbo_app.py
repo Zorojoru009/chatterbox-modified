@@ -1,5 +1,6 @@
 import json
 import gc
+import os
 import random
 import re
 import shutil
@@ -33,6 +34,10 @@ except Exception:  # pragma: no cover - optional Kaggle dependency
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SESSION_ROOT = Path("/kaggle/working/chatterbox_sessions") if Path("/kaggle/working").exists() else Path("outputs/chatterbox_sessions")
+DEFAULT_REFERENCE_AUDIO = os.environ.get(
+    "CHATTERBOX_REFERENCE_AUDIO",
+    "https://storage.googleapis.com/chatterbox-demo-samples/prompts/female_random_podcast.wav",
+)
 
 MODEL_TURBO = "Turbo"
 MODEL_NANO = "Nano"
@@ -585,7 +590,7 @@ def validate_narration_blueprint(blueprint) -> str | None:
     chunks = blueprint.get("chunks")
     if not isinstance(chunks, list) or not chunks:
         return "Blueprint must contain a non-empty `chunks` array."
-    default_model = blueprint.get("default_model", MODEL_TURBO)
+    default_model = blueprint.get("default_model", MODEL_ORIGINAL)
     if default_model not in MODEL_CHOICES:
         return f"`default_model` must be one of {MODEL_CHOICES}; got `{default_model}`."
     for index, entry in enumerate(chunks, start=1):
@@ -610,7 +615,7 @@ def make_session_from_blueprint(blueprint: dict[str, Any]) -> dict[str, Any]:
     project = safe_name(blueprint.get("project_name"), fallback="youtube_narration")
     sid = f"{project}-{uuid.uuid4().hex[:8]}"
     sdir = SESSION_ROOT / sid
-    default_model = blueprint.get("default_model", MODEL_TURBO)
+    default_model = blueprint.get("default_model", MODEL_ORIGINAL)
     default_settings = normalize_blueprint_settings(blueprint.get("default_settings", {}), default_model)
     now_chunks = []
     for index, entry in enumerate(blueprint.get("chunks") or [], start=1):
@@ -693,7 +698,7 @@ def import_narration_blueprint(file_path):
         session.get("full_text", ""),
         session.get("project_name", ""),
         session.get("output_filename", "narration.wav"),
-        session.get("model_name", MODEL_TURBO),
+        session.get("model_name", MODEL_ORIGINAL),
         merge.get("silence_ms", 200),
         merge.get("require_approved", False),
         merge.get("export_mp3", False),
@@ -716,7 +721,7 @@ def load_session(path_value):
         session.get("full_text", ""),
         session.get("project_name", ""),
         session.get("output_filename", "narration.wav"),
-        session.get("model_name", MODEL_TURBO),
+        session.get("model_name", MODEL_ORIGINAL),
         merge.get("silence_ms", 200),
         merge.get("require_approved", False),
         merge.get("export_mp3", False),
@@ -939,6 +944,23 @@ def save_chunk_audio(session: dict[str, Any], chunk: dict[str, Any], wav: torch.
     return str(audio_path)
 
 
+def chunk_settings_for(session: dict[str, Any], chunk: dict[str, Any], ui_settings: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the generation settings for a single chunk.
+
+    For blueprint-imported sessions each chunk's JSON `settings` (and `model_name`)
+    override the UI inputs, so the JSON direction is honored. Regular sessions use the
+    uniform UI settings tuple for every chunk.
+    """
+    if session.get("from_blueprint"):
+        model = chunk.get("model_name") or session.get("model_name") or MODEL_ORIGINAL
+        base = session.get("generation_settings") or {}
+        resolved = normalize_blueprint_settings(chunk.get("settings") or {}, model, base=base)
+        resolved["enable_parallel"] = bool(ui_settings.get("enable_parallel", True))
+        resolved["max_parallel_devices"] = int(ui_settings.get("max_parallel_devices") or 1)
+        return resolved
+    return ui_settings
+
+
 def generate_all_chunks(
     session,
     model_cache,
@@ -971,7 +993,8 @@ def generate_all_chunks(
     )
     settings["enable_parallel"] = bool(enable_parallel)
     settings["max_parallel_devices"] = int(max_parallel_devices or 1)
-    session["generation_settings"] = settings
+    if not session.get("from_blueprint"):
+        session["generation_settings"] = settings
     reference_audio_path = copy_reference_to_session(session, reference_audio_path)
 
     chunks_to_generate = [chunk for chunk in session["chunks"] if chunk["status"] != "excluded"]
@@ -991,7 +1014,7 @@ def generate_all_chunks(
         progress(0.05, desc=f"Loaded {model_name} on {devices[0]}; generating chunks...")
         for chunk_index, chunk in enumerate(chunks_to_generate, start=1):
             try:
-                wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
+                wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, chunk_settings_for(session, chunk, settings))
                 last_audio = save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
                 save_session(session)
                 progress(chunk_index / len(chunks_to_generate), desc=f"Generated chunk {chunk_index}/{len(chunks_to_generate)}")
@@ -1033,7 +1056,7 @@ def generate_all_chunks(
                 chunk["text"],
                 chunk["index"],
                 reference_audio_path,
-                settings,
+                chunk_settings_for(session, chunk, settings),
             )
             future_to_chunk[future] = chunk
 
@@ -1079,67 +1102,6 @@ def generate_all_chunks(
         format_chunk_table(session),
         last_audio,
         status_message(session, f"Parallel batch generation finished across {len(devices)} device(s): {', '.join(devices)}. {auto_status}"),
-    )
-
-
-def generate_all_from_blueprint(
-    session,
-    model_cache,
-    reference_audio_path,
-    progress=gr.Progress(track_tqdm=True),
-):
-    """Generate every chunk with ITS OWN model + settings from a blueprint-imported session.
-
-    Unlike generate_all_chunks (one model + one settings tuple for the whole session),
-    each chunk's declared `model_name` and `settings` are honored, so the blueprint
-    direction is preserved exactly. Sequential on the default device for predictability.
-    """
-    if not session:
-        raise gr.Error("Create or load a session first.")
-    if not session.get("from_blueprint"):
-        raise gr.Error("Use this action only for blueprint-imported sessions (Advanced panel). Regular sessions use Generate All.")
-
-    if session.get("reference_audio_path"):
-        reference_audio_path = copy_reference_to_session(session, session.get("reference_audio_path"))
-    else:
-        reference_audio_path = copy_reference_to_session(session, reference_audio_path)
-
-    chunks_to_generate = [chunk for chunk in session["chunks"] if chunk["status"] != "excluded"]
-    if not chunks_to_generate:
-        return session, model_cache or {}, format_chunk_table(session), None, status_message(session, "No non-excluded chunks to generate.")
-
-    for chunk in chunks_to_generate:
-        chunk["status"] = "generating"
-        chunk["error"] = None
-    save_session(session)
-
-    model_cache = model_cache or {}
-    last_audio = None
-    base_settings = normalize_blueprint_settings(session.get("generation_settings") or {}, session.get("model_name"))
-    for chunk_index, chunk in enumerate(chunks_to_generate, start=1):
-        model = chunk.get("model_name") or session.get("model_name") or MODEL_TURBO
-        settings = normalize_blueprint_settings(chunk.get("settings") or {}, model, base=base_settings)
-        progress((chunk_index - 1) / len(chunks_to_generate), desc=f"Loading {model} for chunk {chunk['index']}...")
-        model_cache, adapter = get_model_adapter(model_cache, model, default_device())
-        try:
-            wav, sr, device = generate_chunk_wav(adapter, chunk["text"], chunk["index"], reference_audio_path, settings)
-            last_audio = save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
-            save_session(session)
-            progress(chunk_index / len(chunks_to_generate), desc=f"Generated chunk {chunk_index}/{len(chunks_to_generate)}")
-        except Exception as exc:
-            chunk["status"] = "failed"
-            chunk["error"] = str(exc)
-            save_session(session)
-            return session, model_cache, format_chunk_table(session), last_audio, status_message(
-                session, f"Blueprint generation stopped at chunk {chunk['index']}: {exc}"
-            )
-
-    return (
-        session,
-        model_cache,
-        format_chunk_table(session),
-        last_audio,
-        status_message(session, f"Blueprint generation finished for {len(chunks_to_generate)} chunk(s)."),
     )
 
 
@@ -1687,7 +1649,7 @@ with gr.Blocks(title="Chatterbox Narration Suite") as demo:
             with gr.Accordion("Project / Session", open=True):
                 project_name = gr.Textbox(value="youtube_narration", label="Project name")
                 output_filename = gr.Textbox(value="narration.wav", label="Result file name")
-                model_name = gr.Dropdown(MODEL_CHOICES, value=MODEL_TURBO, label="Model")
+                model_name = gr.Dropdown(MODEL_CHOICES, value=MODEL_ORIGINAL, label="Model")
                 session_path = gr.Textbox(label="Load existing session directory or session.json path", placeholder="outputs/chatterbox_sessions/...")
                 session_picker = gr.Dropdown(
                     choices=list_session_paths(),
@@ -1719,12 +1681,12 @@ with gr.Blocks(title="Chatterbox Narration Suite") as demo:
                 sources=["upload", "microphone"],
                 type="filepath",
                 label="Reference Audio File",
-                value="https://storage.googleapis.com/chatterbox-demo-samples/prompts/female_random_podcast.wav",
+                value=DEFAULT_REFERENCE_AUDIO,
             )
 
         with gr.Column(scale=1):
             with gr.Accordion("Generation Options", open=True):
-                preset_name = gr.Dropdown(PRESET_CHOICES, value="Reality Mechanism", label="Channel narration preset")
+                preset_name = gr.Dropdown(PRESET_CHOICES, value="Custom", label="Channel narration preset")
                 apply_preset_btn = gr.Button("Apply Preset")
                 seed_num = gr.Number(value=0, label="Random seed (0 for random)")
                 temp = gr.Slider(0.05, 2.0, step=.05, label="Temperature", value=0.8)
@@ -1748,7 +1710,7 @@ with gr.Blocks(title="Chatterbox Narration Suite") as demo:
 
             with gr.Accordion("Whisper Validation", open=True):
                 validation_enabled = gr.Checkbox(
-                    value=False,
+                    value=True,
                     label="Enable Whisper validation (optional)",
                     info="Leave disabled to generate and merge without installing or loading Whisper.",
                 )
@@ -1824,7 +1786,8 @@ with gr.Blocks(title="Chatterbox Narration Suite") as demo:
             generate_advanced_btn = gr.Button("Generate All (Blueprint)")
         advanced_status = gr.Markdown(
             "Upload a blueprint, **Import** it, then **Generate All (Blueprint)**. "
-            "Each chunk is generated with its own model + settings from the JSON. "
+            "Each chunk honors its own model + settings from the JSON and is generated in "
+            "parallel across the available GPUs (same as Generate All). "
             "Review / edit / validate / merge exactly like a normal session."
         )
 
@@ -2054,8 +2017,29 @@ with gr.Blocks(title="Chatterbox Narration Suite") as demo:
     )
 
     generate_advanced_btn.click(
-        fn=generate_all_from_blueprint,
-        inputs=[session_state, model_cache_state, ref_wav],
+        fn=generate_all_chunks,
+        inputs=[
+            session_state,
+            model_cache_state,
+            model_name,
+            ref_wav,
+            temp,
+            seed_num,
+            min_p,
+            top_p,
+            top_k,
+            repetition_penalty,
+            exaggeration,
+            cfg_weight,
+            norm_loudness,
+            enable_parallel,
+            max_parallel_devices,
+            validation_enabled,
+            auto_regenerate,
+            whisper_model_name,
+            whisper_device,
+            validation_threshold,
+        ],
         outputs=[session_state, model_cache_state, chunk_table, chunk_audio, status],
     )
 

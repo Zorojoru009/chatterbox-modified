@@ -14,6 +14,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import argparse
+
 import gradio as gr
 import numpy as np
 import torch
@@ -38,6 +40,17 @@ DEFAULT_REFERENCE_AUDIO = os.environ.get(
     "CHATTERBOX_REFERENCE_AUDIO",
     "https://storage.googleapis.com/chatterbox-demo-samples/prompts/female_random_podcast.wav",
 )
+
+_parser = argparse.ArgumentParser(description="Chatterbox Narration Suite")
+_parser.add_argument(
+    "reference_audio",
+    nargs="?",
+    default=None,
+    help="Path or URL to use as the default reference voice audio.",
+)
+_REFERENCE_AUDIO_ARG = _parser.parse_known_args()[0].reference_audio
+if _REFERENCE_AUDIO_ARG:
+    DEFAULT_REFERENCE_AUDIO = _REFERENCE_AUDIO_ARG
 
 MODEL_TURBO = "Turbo"
 MODEL_NANO = "Nano"

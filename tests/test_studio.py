@@ -23,8 +23,14 @@ from chatterbox.studio.session import (
     split_sentences_preserving_tags,
 )
 from chatterbox.studio.validator import (
+    build_full_report_markdown,
+    build_validation_overview,
     normalize_validation_text,
     validation_comparison,
+)
+from chatterbox.studio.ui import (
+    on_jump_to_problem,
+    update_validation_scorecard,
 )
 
 
@@ -369,6 +375,134 @@ class StudioUnitTests(unittest.TestCase):
             adapter.ensure_conditionals(ref_path, exaggeration=0.5, norm_loudness=True)
             self.assertEqual(mock_model.prepare_conditionals.call_count, 1)
 
+    def test_build_validation_overview_clean(self):
+        session = {
+            "project_name": "clean_project",
+            "chunks": [
+                {
+                    "index": 1,
+                    "id": "c001",
+                    "text": "Hello world.",
+                    "status": "ready",
+                    "audio_path": "/fake/audio1.wav",
+                    "validation_status": "passed",
+                    "text_score": 0.98,
+                    "audio_quality_status": "passed",
+                },
+                {
+                    "index": 2,
+                    "id": "c002",
+                    "text": "Everything is great.",
+                    "status": "ready",
+                    "audio_path": "/fake/audio2.wav",
+                    "validation_status": "passed",
+                    "text_score": 0.95,
+                    "audio_quality_status": "passed",
+                },
+            ],
+        }
+        scorecard, problems, btn_text = build_validation_overview(session)
+        self.assertIn("100% Clean! All 2 validated chunk(s) passed", scorecard)
+        self.assertIn("Hello world", build_full_report_markdown(session))
+        self.assertEqual(len(problems), 0)
+        self.assertEqual(btn_text, "🔄 Regenerate Chunks Needing Review")
+
+    def test_build_validation_overview_with_problems(self):
+        session = {
+            "project_name": "review_project",
+            "chunks": [
+                {
+                    "index": 1,
+                    "id": "c001",
+                    "text": "This one is clean.",
+                    "status": "ready",
+                    "audio_path": "/fake/audio1.wav",
+                    "validation_status": "passed",
+                    "text_score": 0.97,
+                    "audio_quality_status": "passed",
+                },
+                {
+                    "index": 2,
+                    "id": "c002",
+                    "text": "This one has early cutoff.",
+                    "status": "ready",
+                    "audio_path": "/fake/audio2.wav",
+                    "validation_status": "needs_review",
+                    "validation_category": "early_cutoff",
+                    "validation_error": "Audio cut off early: ended 4 words before expected text.",
+                    "transcript": "This one has",
+                    "text_score": 0.60,
+                },
+                {
+                    "index": 3,
+                    "id": "c003",
+                    "text": "This one failed during generation.",
+                    "status": "failed",
+                    "error": "CUDA out of memory",
+                },
+                {
+                    "index": 4,
+                    "id": "c004",
+                    "text": "This one has clipping audio.",
+                    "status": "ready",
+                    "audio_path": "/fake/audio4.wav",
+                    "validation_status": "passed",
+                    "text_score": 0.96,
+                    "audio_quality_status": "needs_review",
+                    "audio_quality_error": "Clipping detected",
+                },
+                {
+                    "index": 5,
+                    "id": "c005",
+                    "text": "This one is excluded.",
+                    "status": "excluded",
+                },
+            ],
+        }
+        scorecard, problems, btn_text = build_validation_overview(session)
+        self.assertIn("3 chunk(s) need attention", scorecard)
+        self.assertIn("Early Cutoff", scorecard)
+        self.assertIn("CUDA out of memory", scorecard)
+        self.assertIn("Clipping detected", scorecard)
+        self.assertIn("1 chunk(s) currently marked as excluded", scorecard)
+        self.assertEqual(len(problems), 3)
+        self.assertEqual(btn_text, "🔄 Regenerate 3 Problem Chunk(s)")
+
+        # Verify problem indices
+        problem_indices = [idx for label, idx in problems]
+        self.assertEqual(problem_indices, [3, 2, 4])
+
+        # Verify full report markdown table
+        full_md = build_full_report_markdown(session)
+        self.assertIn("| 1 | `c001` | `ready` | ✅ `passed` |", full_md)
+        self.assertIn("| 2 | `c002` | `ready` | ⚠️ `needs_review` |", full_md)
+        self.assertIn("| 3 | `c003` | `failed` | 💥 `unvalidated` |", full_md)
+
+    def test_ui_jump_to_problem_and_scorecard_updates(self):
+        session = {
+            "project_name": "jump_test",
+            "chunks": [
+                {"index": 1, "id": "c001", "text": "First chunk", "status": "pending"},
+                {"index": 2, "id": "c002", "text": "Second problem chunk", "status": "failed", "error": "Synth error"},
+            ],
+        }
+        # Jump using integer
+        res = on_jump_to_problem(session, 2)
+        self.assertEqual(res[0], 2)
+        self.assertEqual(res[1], "Second problem chunk")
+        self.assertIn("Jumped to problem chunk", res[5])
+
+        # Jump using label string
+        res_str = on_jump_to_problem(session, "Chunk 2 (c002) — Generation Error")
+        self.assertEqual(res_str[0], 2)
+        self.assertEqual(res_str[1], "Second problem chunk")
+
+        # Scorecard update function
+        scorecard_md, dropdown, full_md, btn = update_validation_scorecard(session)
+        self.assertIn("Validation Health Scorecard", scorecard_md)
+        self.assertIn("Detailed Verification Manifest", full_md)
+
 
 if __name__ == "__main__":
     unittest.main()
+

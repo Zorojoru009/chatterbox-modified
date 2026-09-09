@@ -55,6 +55,8 @@ from .session import (
     status_message,
 )
 from .validator import (
+    build_full_report_markdown,
+    build_validation_overview,
     check_audio_all,
     check_audio_selected,
     export_validation_report,
@@ -175,6 +177,45 @@ def on_table_select(session: dict[str, Any] | None = None, evt: gr.SelectData | 
         chunk.get("transcript") or "",
         validation_details(chunk),
         status_message(session, f"Selected chunk {chunk.get('id') or chunk['index']} from manifest."),
+    )
+
+
+def update_validation_scorecard(session: dict[str, Any] | None):
+    """Generate updated scorecard markdown, problem choices, full report, and button label."""
+    scorecard_md, problem_choices, btn_text = build_validation_overview(session)
+    full_md = build_full_report_markdown(session)
+    if gr is not None:
+        dropdown_update = gr.Dropdown(choices=problem_choices, value=None)
+        btn_update = gr.Button(value=btn_text)
+    else:
+        dropdown_update = problem_choices
+        btn_update = btn_text
+    return scorecard_md, dropdown_update, full_md, btn_update
+
+
+def on_jump_to_problem(session: dict[str, Any] | None = None, selected_choice: Any = None):
+    """Load the selected problem chunk directly into the inspector & editor."""
+    if not session or not session.get("chunks"):
+        return (1, "", None, "", "No active session.", "No active session.")
+    if selected_choice is None:
+        return (1, "", None, "", "No chunk selected.", "No chunk selected.")
+    try:
+        chunk_num = int(selected_choice)
+    except (ValueError, TypeError):
+        import re
+        match = re.search(r"Chunk\s+(\d+)", str(selected_choice))
+        if match:
+            chunk_num = int(match.group(1))
+        else:
+            return (1, "", None, "", "Invalid chunk selection.", "Invalid chunk selection.")
+    chunk = get_chunk(session, chunk_num)
+    return (
+        chunk_num,
+        chunk["text"],
+        chunk.get("audio_path"),
+        chunk.get("transcript") or "",
+        validation_details(chunk),
+        status_message(session, f"Jumped to problem chunk {chunk.get('id') or chunk['index']}."),
     )
 
 
@@ -441,6 +482,23 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 with gr.Row():
                     generate_all_btn = gr.Button("🚀 Generate All Chunks (Batch)", variant="primary", scale=2)
 
+                # =====================================================================
+                # VALIDATION DASHBOARD & SCORECARD
+                # =====================================================================
+                validation_scorecard_md = gr.Markdown("### 📊 Validation Health Scorecard\n*(No session active)*")
+                with gr.Row():
+                    failed_chunks_dropdown = gr.Dropdown(
+                        label="⚠️ Jump Directly to Problem Chunk",
+                        choices=[],
+                        scale=3,
+                        info="Select a flagged chunk to jump immediately into Chunk Inspector & Editor without hunting row-by-row.",
+                    )
+                    regenerate_problems_btn = gr.Button("🔄 Regenerate Problem Chunks", variant="secondary", scale=2)
+                    refresh_scorecard_btn = gr.Button("🔄 Refresh Scorecard", scale=1)
+
+                with gr.Accordion("📋 View Full Inspection Manifest Table", open=False):
+                    full_report_md = gr.Markdown("*(No session active)*")
+
                 gr.Markdown("### 3. Narration Chunks Manifest")
                 chunk_table = gr.Dataframe(
                     headers=[
@@ -593,6 +651,27 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
         # EVENT BINDINGS
         # -------------------------------------------------------------------------
 
+        scorecard_outputs = [
+            validation_scorecard_md,
+            failed_chunks_dropdown,
+            full_report_md,
+            regenerate_problems_btn,
+        ]
+
+        # Jump directly to problem chunk when selected from dropdown
+        failed_chunks_dropdown.change(
+            fn=on_jump_to_problem,
+            inputs=[session_state, failed_chunks_dropdown],
+            outputs=[chunk_number, chunk_editor, chunk_audio, chunk_transcript, chunk_validation, global_status],
+        )
+
+        # Quick refresh button for scorecard
+        refresh_scorecard_btn.click(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
+        )
+
         # Blueprint Import
         import_blueprint_btn.click(
             fn=import_narration_blueprint,
@@ -612,6 +691,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 blueprint_summary,
                 global_status,
             ],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         # Progress default hook helper
@@ -674,6 +757,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 validation_threshold,
             ],
             outputs=[session_state, model_cache_state, chunk_table, chunk_audio, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         # Click table row to inspect chunk immediately
@@ -706,6 +793,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             fn=save_selected_chunk,
             inputs=[session_state, chunk_number, chunk_editor],
             outputs=[session_state, chunk_table, chunk_audio, chunk_transcript, chunk_validation, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         # Generate Selected Chunk (with live progress tracking)
@@ -751,18 +842,30 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 norm_loudness,
             ],
             outputs=[session_state, model_cache_state, chunk_table, chunk_audio, chunk_transcript, chunk_validation, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         approve_btn.click(
             fn=approve_selected_chunk,
             inputs=[session_state, chunk_number],
             outputs=[session_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         exclude_btn.click(
             fn=exclude_selected_chunk,
             inputs=[session_state, chunk_number],
             outputs=[session_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         # Validation & Audio Checks (with live progress tracking)
@@ -784,6 +887,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             fn=on_validate_selected,
             inputs=[session_state, chunk_number, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
             outputs=[session_state, chunk_table, chunk_transcript, chunk_validation, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         def on_validate_all(
@@ -803,6 +910,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             fn=on_validate_all,
             inputs=[session_state, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
             outputs=[session_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         def on_regenerate_failed(
@@ -857,6 +968,41 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 validation_enabled,
             ],
             outputs=[session_state, model_cache_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
+        )
+
+        # Also wire the scorecard problem chunk regeneration button
+        regenerate_problems_btn.click(
+            fn=on_regenerate_failed,
+            inputs=[
+                session_state,
+                model_cache_state,
+                hidden_model_name,
+                ref_wav,
+                temp,
+                seed_num,
+                min_p,
+                top_p,
+                top_k,
+                repetition_penalty,
+                exaggeration,
+                cfg_weight,
+                norm_loudness,
+                enable_parallel,
+                max_parallel_devices,
+                validation_threshold,
+                whisper_model_name,
+                whisper_device,
+                validation_enabled,
+            ],
+            outputs=[session_state, model_cache_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         def on_check_audio_selected(
@@ -888,6 +1034,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 min_rms_dbfs,
             ],
             outputs=[session_state, chunk_table, chunk_validation, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         def on_check_audio_all(
@@ -917,6 +1067,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 min_rms_dbfs,
             ],
             outputs=[session_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         export_report_btn.click(
@@ -980,6 +1134,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 blueprint_summary,
                 global_status,
             ],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         export_blueprint_btn.click(
@@ -1022,6 +1180,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             fn=load_session,
             inputs=[tab1_session_picker, ref_wav],
             outputs=session_load_outputs,
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         # Tab 3 Sessions Browser
@@ -1034,12 +1196,20 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             fn=load_session,
             inputs=[session_picker, ref_wav],
             outputs=session_load_outputs,
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
         load_session_path_btn.click(
             fn=load_session,
             inputs=[session_path, ref_wav],
             outputs=session_load_outputs,
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
         )
 
     return demo

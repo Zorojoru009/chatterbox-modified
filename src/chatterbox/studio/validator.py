@@ -791,3 +791,129 @@ def export_validation_report(session: dict[str, Any]):
     temp_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     temp_path.replace(report_path)
     return str(report_path), status_message(session, f"Exported validation report: `{report_path.name}`.")
+
+
+def build_validation_overview(session: dict[str, Any] | None) -> tuple[str, list[tuple[str, int]], str]:
+    """Build a comprehensive validation dashboard overview, failed choices, and button label."""
+    if not session or not session.get("chunks"):
+        return "### 📊 Validation Health Scorecard\n*(No session active)*", [], "🔄 Regenerate Problem Chunks"
+
+    chunks = session.get("chunks", [])
+    total = len(chunks)
+    generated = sum(bool(c.get("audio_path")) for c in chunks)
+    excluded = sum(c.get("status") == "excluded" for c in chunks)
+
+    whisper_validated = [c for c in chunks if c.get("validation_status") and c.get("status") != "excluded"]
+    whisper_passed = [c for c in whisper_validated if c.get("validation_status") == "passed"]
+    whisper_needs_review = [c for c in whisper_validated if c.get("validation_status") != "passed"]
+
+    audio_checked = [c for c in chunks if c.get("audio_quality_status") and c.get("status") != "excluded"]
+    audio_passed = [c for c in audio_checked if c.get("audio_quality_status") == "passed"]
+    audio_needs_review = [c for c in audio_checked if c.get("audio_quality_status") != "passed"]
+
+    synth_failed = [c for c in chunks if c.get("status") == "failed" and c.get("status") != "excluded"]
+
+    w_count = len(whisper_validated)
+    w_pct = f"{(len(whisper_passed) / w_count * 100):.1f}%" if w_count else "—"
+    a_count = len(audio_checked)
+    a_pct = f"{(len(audio_passed) / a_count * 100):.1f}%" if a_count else "—"
+
+    total_problems = len(whisper_needs_review) + len(audio_needs_review) + len(synth_failed)
+
+    # Headline status badge
+    if not whisper_validated and not audio_checked and not synth_failed:
+        badge = "⏳ *(Validation not run yet)*"
+    elif total_problems == 0:
+        badge = f"🎉 **100% Clean! All {len(whisper_passed)} validated chunk(s) passed**"
+    else:
+        badge = f"⚠️ **{total_problems} chunk(s) need attention**"
+
+    lines = [
+        f"### 📊 Validation Health Scorecard — {badge}",
+        "",
+        "| Metric | Total Chunks | Audio Generated | Whisper ASR Passed | Whisper Needs Review | Audio Acoustic Checks |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: |",
+        f"| **Count / Ratio** | **{total}** | **{generated}/{total}** | **{len(whisper_passed)}/{w_count or total}** ({w_pct}) | **{len(whisper_needs_review)}** | **{len(audio_passed)}/{a_count or total}** ({a_pct}) |",
+        "",
+    ]
+    if excluded > 0:
+        lines.append(f"*(Note: {excluded} chunk(s) currently marked as excluded)*\n")
+
+    problem_choices: list[tuple[str, int]] = []
+    seen_indices = set()
+
+    if synth_failed:
+        lines.append("#### 💥 Generation / Synthesis Errors:")
+        for c in synth_failed:
+            seen_indices.add(c["index"])
+            cid = c.get("id") or f"c{c['index']:03d}"
+            err = c.get("error") or "Generation error occurred"
+            lines.append(f"- 💥 **Chunk {c['index']}** (`{cid}`) — *{err}*")
+            problem_choices.append((f"Chunk {c['index']} ({cid}) — Generation Error", c["index"]))
+        lines.append("")
+
+    if whisper_needs_review:
+        cat_counts: dict[str, int] = {}
+        for c in whisper_needs_review:
+            cat = c.get("validation_category") or "other"
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        cat_labels = [f"**{k.replace('_', ' ').title()}**: {v}" for k, v in sorted(cat_counts.items())]
+        lines.append(f"**Diagnostic Issues Breakdown:** {', '.join(cat_labels)}")
+        lines.append("")
+        lines.append("#### ⚠️ Whisper Speech Verification Issues:")
+        for c in whisper_needs_review:
+            seen_indices.add(c["index"])
+            cid = c.get("id") or f"c{c['index']:03d}"
+            cat = (c.get("validation_category") or "needs_review").replace("_", " ").title()
+            score = f"{c.get('text_score', 0):.2f}"
+            detail = c.get("validation_error") or "Speech text mismatch"
+            transcript = f' Transcribed: "{c.get("transcript")}"' if c.get("transcript") else ""
+            lines.append(f"- 🔴 **Chunk {c['index']}** (`{cid}`) [Score: `{score}`] — **{cat}**: *{detail}*{transcript}")
+            problem_choices.append((f"Chunk {c['index']} ({cid}) — {cat} (Score: {score})", c["index"]))
+        lines.append("")
+
+    if audio_needs_review:
+        lines.append("#### 🟡 Audio Quality Issues:")
+        for c in audio_needs_review:
+            cid = c.get("id") or f"c{c['index']:03d}"
+            detail = c.get("audio_quality_error") or "Acoustic issue"
+            lines.append(f"- 🟡 **Chunk {c['index']}** (`{cid}`) — *{detail}*")
+            if c["index"] not in seen_indices:
+                seen_indices.add(c["index"])
+                problem_choices.append((f"Chunk {c['index']} ({cid}) — Audio Quality Issue", c["index"]))
+        lines.append("")
+
+    if whisper_validated and not whisper_needs_review and not audio_needs_review and not synth_failed:
+        lines.append("✅ *All validated chunks meet or exceed your text accuracy and acoustic quality criteria.*")
+
+    btn_text = f"🔄 Regenerate {len(problem_choices)} Problem Chunk(s)" if problem_choices else "🔄 Regenerate Chunks Needing Review"
+    return "\n".join(lines), problem_choices, btn_text
+
+
+def build_full_report_markdown(session: dict[str, Any] | None) -> str:
+    """Generate a full markdown table view of all chunks and their validation details."""
+    if not session or not session.get("chunks"):
+        return "*(No session active)*"
+    chunks = session.get("chunks", [])
+    lines = [
+        f"### 📋 Detailed Verification Manifest — `{session.get('project_name', 'Narration')}`",
+        "",
+        "| # | ID | Status | Whisper | Score | Diagnostic | Transcript | Text Preview |",
+        "| :---: | :---: | :---: | :---: | :---: | :--- | :--- | :--- |",
+    ]
+    for c in chunks:
+        idx = c["index"]
+        cid = c.get("id") or f"c{idx:03d}"
+        status = c.get("status") or "pending"
+        v_status = c.get("validation_status") or "unvalidated"
+        icon = "✅" if v_status == "passed" else ("⚠️" if v_status == "needs_review" else ("💥" if status == "failed" else "⏳"))
+        score = f"{c.get('text_score', 0):.2f}" if c.get("text_score") is not None else "—"
+        cat = (c.get("validation_category") or "—").replace("_", " ").title()
+        transcript = (c.get("transcript") or "—").replace("\n", " ")
+        if len(transcript) > 40:
+            transcript = transcript[:37] + "..."
+        preview = c["text"].replace("\n", " ")
+        if len(preview) > 40:
+            preview = preview[:37] + "..."
+        lines.append(f"| {idx} | `{cid}` | `{status}` | {icon} `{v_status}` | `{score}` | {cat} | *{transcript}* | {preview} |")
+    return "\n".join(lines)

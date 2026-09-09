@@ -258,10 +258,13 @@ def status_message(session: dict[str, Any] | None, prefix: str = "") -> str:
     for chunk in session.get("chunks", []):
         counts[chunk["status"]] = counts.get(chunk["status"], 0) + 1
     summary = ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "no chunks"
+    sid = session.get("session_id", session.get("project_name", "unnamed"))
+    model = session.get("model_name", "default")
+    sdir = session.get("session_dir", "in-memory")
     message = (
         f"{prefix + ' ' if prefix else ''}"
-        f"Session `{session['session_id']}` | model: `{session['model_name']}` | chunks: {summary} | "
-        f"path: `{session['session_dir']}`"
+        f"Session `{sid}` | model: `{model}` | chunks: {summary} | "
+        f"path: `{sdir}`"
     )
     return message
 

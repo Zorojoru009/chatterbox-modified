@@ -136,11 +136,22 @@ if __name__ == "__main__":
         "share": args.share,
         "allowed_paths": [str(SESSION_ROOT.resolve())],
         "server_name": args.server_name,
+        "css": CUSTOM_CSS,
     }
     if args.port:
         launch_kwargs["server_port"] = args.port
 
-    demo.queue(
-        max_size=50,
-        default_concurrency_limit=1,
-    ).launch(**launch_kwargs)
+    try:
+        demo.queue(
+            max_size=50,
+            default_concurrency_limit=1,
+        ).launch(**launch_kwargs)
+    except TypeError as exc:
+        if "css" in str(exc) and "css" in launch_kwargs:
+            launch_kwargs.pop("css", None)
+            demo.queue(
+                max_size=50,
+                default_concurrency_limit=1,
+            ).launch(**launch_kwargs)
+        else:
+            raise

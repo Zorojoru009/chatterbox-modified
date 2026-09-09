@@ -157,9 +157,14 @@ def load_session(path_value: str, current_ref_audio: str | None = None):
     )
 
 
-def on_table_select(session: dict[str, Any] | None, evt: gr.SelectData):
+def on_table_select(session: dict[str, Any] | None = None, evt: gr.SelectData | None = None):
+    # Defensively handle either argument order from Gradio
+    if isinstance(session, gr.SelectData):
+        evt, session = session, evt
     if not session or not session.get("chunks"):
         return (1, "", None, "", "No active session.", "No active session.")
+    if evt is None:
+        return (1, "", None, "", "No chunk selected.", "No chunk selected.")
     row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else int(evt.index)
     chunk_num = row_idx + 1
     chunk = get_chunk(session, chunk_num)
@@ -339,7 +344,17 @@ def auto_validate_and_regenerate_callback(
 
 
 def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> gr.Blocks:
-    with gr.Blocks(title="Chatterbox Narration Studio", css=CUSTOM_CSS) as demo:
+    blocks_kwargs: dict[str, Any] = {"title": "Chatterbox Narration Studio"}
+    # Gradio 5.0+ moved css from Blocks constructor to launch()
+    try:
+        if gr is not None and hasattr(gr, "__version__"):
+            major_ver = int(str(gr.__version__).split(".")[0])
+            if major_ver < 5:
+                blocks_kwargs["css"] = CUSTOM_CSS
+    except Exception:
+        pass
+
+    with gr.Blocks(**blocks_kwargs) as demo:
         session_state = gr.State(None)
         model_cache_state = gr.State({})
 
@@ -601,7 +616,7 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
 
         # Generate All Chunks
         generate_all_btn.click(
-            fn=lambda session, cache, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl, ep, mpd, ve, ar, wm, wd, vt: generate_all_chunks(
+            fn=lambda session, cache, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl, ep, mpd, se, ve, ar, wm, wd, vt: generate_all_chunks(
                 session=session,
                 model_cache=cache,
                 model_name=model,

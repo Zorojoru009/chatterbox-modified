@@ -339,6 +339,36 @@ class StudioUnitTests(unittest.TestCase):
             self.assertTrue(any(l.startswith("#002") for l in labels))
             self.assertTrue(any(l.startswith("#001") for l in labels))
 
+    def test_model_adapter_voice_conditioning_cache(self):
+        import tempfile
+        from unittest.mock import MagicMock
+        from chatterbox.studio.engine import ModelAdapter
+
+        # Create dummy adapter with mocked model
+        adapter = object.__new__(ModelAdapter)
+        adapter.model_name = "Turbo"
+        adapter.device = "cpu"
+        adapter.cached_ref_path = None
+        adapter.cached_norm_loudness = None
+        mock_model = MagicMock()
+        mock_model.conds = None
+        adapter.model = mock_model
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".wav") as f:
+            ref_path = f.name
+            # First call: must run prepare_conditionals
+            def fake_prep(*args, **kwargs):
+                mock_model.conds = "dummy_conds"
+            mock_model.prepare_conditionals.side_effect = fake_prep
+
+            adapter.ensure_conditionals(ref_path, exaggeration=0.5, norm_loudness=True)
+            self.assertEqual(mock_model.prepare_conditionals.call_count, 1)
+            self.assertEqual(adapter.cached_ref_path, str(Path(ref_path).resolve()))
+
+            # Second call with same ref: must be a NO-OP (0 calls added!)
+            adapter.ensure_conditionals(ref_path, exaggeration=0.5, norm_loudness=True)
+            self.assertEqual(mock_model.prepare_conditionals.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

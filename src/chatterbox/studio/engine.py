@@ -1,6 +1,7 @@
 import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -47,11 +48,27 @@ MODEL_ADAPTERS: dict[str, "ModelAdapter"] = {}
 MODEL_ADAPTERS_LOCK = threading.Lock()
 
 
+def configure_cuda_optimizations():
+    """Enable cuDNN benchmark and TensorCore acceleration for NVIDIA GPUs (T4, A100, etc.)."""
+    if torch is not None and torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
+
 class ModelAdapter:
     def __init__(self, model_name: str, device: str):
         self.model_name = model_name
         self.device = device
         self.lock = threading.Lock()
+        self.cached_ref_path: str | None = None
+        self.cached_norm_loudness: bool | None = None
+
+        configure_cuda_optimizations()
+
         if model_name == MODEL_NANO:
             print(f"Loading Chatterbox Nano on {device}...")
             self.model = ChatterboxTurboTTS.from_pretrained(device, nano=True)
@@ -65,6 +82,35 @@ class ModelAdapter:
     @property
     def sr(self) -> int:
         return self.model.sr
+
+    def ensure_conditionals(
+        self,
+        audio_prompt_path: str | None,
+        exaggeration: float = 0.5,
+        norm_loudness: bool = True,
+    ):
+        """Pre-compute and cache reference voice embeddings once, bypassing redundant audio decoding."""
+        if not audio_prompt_path:
+            return
+
+        resolved = str(Path(audio_prompt_path).resolve())
+        # If already cached for this exact audio file & loudness setting, reuse immediately (0ms overhead)
+        if (
+            self.cached_ref_path == resolved
+            and self.cached_norm_loudness == norm_loudness
+            and getattr(self.model, "conds", None) is not None
+        ):
+            return
+
+        # Prepare conditionals on this device
+        if self.model_name == MODEL_ORIGINAL:
+            self.model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            self.model.prepare_conditionals(
+                audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness
+            )
+        self.cached_ref_path = resolved
+        self.cached_norm_loudness = norm_loudness
 
     def generate(
         self,
@@ -80,10 +126,19 @@ class ModelAdapter:
         norm_loudness: bool,
     ) -> torch.Tensor:
         with self.lock:
+            # Ensure reference voice conditionals are loaded and cached
+            if audio_prompt_path:
+                self.ensure_conditionals(
+                    audio_prompt_path, exaggeration=exaggeration, norm_loudness=norm_loudness
+                )
+
+            # Pass prompt_path=None so the model uses the precomputed cached conditionals
+            prompt_to_pass = None if getattr(self.model, "conds", None) is not None else audio_prompt_path
+
             if self.model_name == MODEL_ORIGINAL:
                 return self.model.generate(
                     text,
-                    audio_prompt_path=audio_prompt_path,
+                    audio_prompt_path=prompt_to_pass,
                     exaggeration=exaggeration,
                     temperature=temperature,
                     cfg_weight=cfg_weight,
@@ -94,7 +149,7 @@ class ModelAdapter:
 
             return self.model.generate(
                 text,
-                audio_prompt_path=audio_prompt_path,
+                audio_prompt_path=prompt_to_pass,
                 temperature=temperature,
                 top_p=top_p,
                 top_k=int(top_k),
@@ -213,18 +268,20 @@ def generate_chunk_wav(
     if seed_num:
         set_seed(seed_num + int(chunk_index))
 
-    wav = adapter.generate(
-        chunk_text,
-        audio_prompt_path=reference_audio_path,
-        temperature=float(settings["temperature"]),
-        min_p=float(settings["min_p"]),
-        top_p=float(settings["top_p"]),
-        top_k=int(settings["top_k"]),
-        repetition_penalty=float(settings["repetition_penalty"]),
-        exaggeration=float(settings["exaggeration"]),
-        cfg_weight=float(settings["cfg_weight"]),
-        norm_loudness=bool(settings["norm_loudness"]),
-    )
+    context = torch.inference_mode() if (torch is not None and hasattr(torch, "inference_mode")) else nullcontext()
+    with context:
+        wav = adapter.generate(
+            chunk_text,
+            audio_prompt_path=reference_audio_path,
+            temperature=float(settings["temperature"]),
+            min_p=float(settings["min_p"]),
+            top_p=float(settings["top_p"]),
+            top_k=int(settings["top_k"]),
+            repetition_penalty=float(settings["repetition_penalty"]),
+            exaggeration=float(settings["exaggeration"]),
+            cfg_weight=float(settings["cfg_weight"]),
+            norm_loudness=bool(settings["norm_loudness"]),
+        )
     return wav.cpu(), adapter.sr, adapter.device
 
 
@@ -408,7 +465,14 @@ def generate_all_chunks(
     if len(devices) == 1:
         prog(0, desc=f"Loading {target_model} on {devices[0]}...")
         model_cache, adapter = get_model_adapter(model_cache, target_model, devices[0])
-        prog(0.05, desc=f"Loaded {target_model} on {devices[0]}; generating chunks...")
+        if reference_audio_path:
+            prog(0.04, desc=f"Preparing reference voice on {devices[0]}...")
+            adapter.ensure_conditionals(
+                reference_audio_path,
+                exaggeration=float(ui_settings.get("exaggeration", 0.5)),
+                norm_loudness=bool(ui_settings.get("norm_loudness", True)),
+            )
+        prog(0.05, desc=f"Ready on {devices[0]}; generating chunks...")
 
         first_error = None
         for chunk_index, chunk in enumerate(chunks_to_generate, start=1):
@@ -475,7 +539,16 @@ def generate_all_chunks(
     for device in devices:
         model_cache, adapter = get_model_adapter(model_cache, target_model, device)
         adapters.append(adapter)
-        prog(len(adapters) / len(devices) * 0.1, desc=f"Loaded {target_model} on {device} ({len(adapters)}/{len(devices)})")
+        prog(len(adapters) / len(devices) * 0.08, desc=f"Loaded {target_model} on {device} ({len(adapters)}/{len(devices)})")
+
+    if reference_audio_path:
+        for a_idx, adapter in enumerate(adapters, start=1):
+            prog(0.08 + (a_idx / len(adapters)) * 0.04, desc=f"Preparing reference voice on {adapter.device} ({a_idx}/{len(adapters)})...")
+            adapter.ensure_conditionals(
+                reference_audio_path,
+                exaggeration=float(ui_settings.get("exaggeration", 0.5)),
+                norm_loudness=bool(ui_settings.get("norm_loudness", True)),
+            )
 
     future_to_chunk = {}
     max_workers = len(adapters)

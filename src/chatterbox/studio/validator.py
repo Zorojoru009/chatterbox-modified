@@ -431,11 +431,6 @@ def transcribe_audio(
 
     model = get_whisper_model(whisper_model_name, whisper_device)
 
-    # Supply initial prompt from expected text to bias vocabulary & proper nouns
-    prompt = None
-    if prompt_text:
-        prompt = normalize_validation_text(prompt_text, filter_fillers=False)[:250]
-
     # Prepare audio input with edge silence padding to prevent boundary truncation
     audio_input: Any = audio_path
     if ta is not None and np is not None:
@@ -471,8 +466,6 @@ def transcribe_audio(
         }
     if language:
         kwargs["language"] = language
-    if prompt:
-        kwargs["initial_prompt"] = prompt
 
     segments, _info = model.transcribe(audio_input, **kwargs)
     return " ".join(segment.text.strip() for segment in segments).strip()

@@ -502,6 +502,28 @@ class StudioUnitTests(unittest.TestCase):
         self.assertIn("Validation Health Scorecard", scorecard_md)
         self.assertIn("Detailed Verification Manifest", full_md)
 
+    def test_transcribe_audio_padded_kwargs(self):
+        from unittest.mock import MagicMock, patch
+        from chatterbox.studio.validator import transcribe_audio
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".wav") as f:
+            mock_model = MagicMock()
+            mock_segment = MagicMock()
+            mock_segment.text = "Hello world"
+            mock_model.transcribe.return_value = ([mock_segment], None)
+
+            with patch("chatterbox.studio.validator.get_whisper_model", return_value=mock_model):
+                text = transcribe_audio(f.name, "small.en", "cpu", prompt_text="Hello world")
+                self.assertEqual(text, "Hello world")
+                self.assertTrue(mock_model.transcribe.called)
+                _args, kwargs = mock_model.transcribe.call_args
+                self.assertFalse(kwargs["vad_filter"])
+                self.assertTrue(kwargs["without_timestamps"])
+                self.assertEqual(kwargs["compression_ratio_threshold"], 2.6)
+                self.assertEqual(kwargs["no_speech_threshold"], 0.4)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -422,6 +422,7 @@ def transcribe_audio(
     whisper_device: str,
     prompt_text: str = "",
     language: str = "en",
+    vad_filter: bool = False,
 ) -> str:
     if not audio_path or not Path(audio_path).exists():
         if gr is not None:
@@ -435,17 +436,45 @@ def transcribe_audio(
     if prompt_text:
         prompt = normalize_validation_text(prompt_text, filter_fillers=False)[:250]
 
+    # Prepare audio input with edge silence padding to prevent boundary truncation
+    audio_input: Any = audio_path
+    if ta is not None and np is not None:
+        try:
+            wav, sr = ta.load(audio_path)
+            if wav.ndim == 2:
+                wav = wav.mean(dim=0, keepdim=True)
+            if sr != 16000:
+                resampler = ta.transforms.Resample(orig_freq=sr, new_freq=16000)
+                wav = resampler(wav)
+                sr = 16000
+            samples = wav.squeeze(0).float().numpy()
+            # Pad 250ms silence on both sides to prevent mel spectrogram edge cutoff
+            pad_samples = int(sr * 0.25)
+            samples = np.pad(samples, (pad_samples, pad_samples), mode="constant")
+            audio_input = samples
+        except Exception:
+            audio_input = audio_path
+
     kwargs: dict[str, Any] = {
         "beam_size": 5,
-        "vad_filter": True,
+        "vad_filter": vad_filter,
         "condition_on_previous_text": False,
+        "without_timestamps": True,
+        "compression_ratio_threshold": 2.6,
+        "no_speech_threshold": 0.4,
     }
+    if vad_filter:
+        kwargs["vad_parameters"] = {
+            "threshold": 0.20,
+            "speech_pad_ms": 400,
+            "min_silence_duration_ms": 1000,
+        }
     if language:
         kwargs["language"] = language
     if prompt:
         kwargs["initial_prompt"] = prompt
 
-    segments, _info = model.transcribe(audio_path, **kwargs)
+    segments, _info = model.transcribe(audio_input, **kwargs)
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 
@@ -476,6 +505,7 @@ def validate_chunk(
     whisper_model_name: str,
     whisper_device: str,
     validation_threshold: float,
+    vad_filter: bool = False,
 ) -> dict[str, Any]:
     transcript = transcribe_audio(
         chunk.get("audio_path"),
@@ -483,6 +513,7 @@ def validate_chunk(
         whisper_device,
         prompt_text=chunk.get("text", ""),
         language="en",
+        vad_filter=vad_filter,
     )
     comparison = validation_comparison(chunk["text"], transcript, float(validation_threshold))
     result = {

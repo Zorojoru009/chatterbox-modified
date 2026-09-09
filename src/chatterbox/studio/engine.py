@@ -273,14 +273,17 @@ def generate_selected_chunk(
     cfg_weight: float,
     norm_loudness: bool,
     validation_details_fn: Any = None,
+    progress: Any = None,
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
 
+    prog = progress if callable(progress) else (lambda *args, **kwargs: None)
     chunk = get_chunk(session, int(chunk_number or 1))
     target_model = chunk.get("model_name") or model_name
     ensure_model_consistency(session, target_model)
 
+    prog(0.05, desc=f"Loading model {target_model}...")
     ui_settings = collect_generation_settings(
         temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness
     )
@@ -293,6 +296,7 @@ def generate_selected_chunk(
     chunk["error"] = None
     save_session(session)
 
+    prog(0.35, desc=f"Synthesizing chunk {chunk.get('id') or chunk['index']}...")
     try:
         wav, sr, device = generate_chunk_wav(
             adapter,
@@ -301,8 +305,10 @@ def generate_selected_chunk(
             reference_audio_path,
             resolved_settings,
         )
+        prog(0.85, desc="Saving audio file...")
         audio_path = save_chunk_audio(session, chunk, wav, sr, adapter.model_name, device)
         save_session(session)
+        prog(1.0, desc=f"Chunk {chunk.get('id') or chunk['index']} generated!")
     except Exception as exc:
         chunk["status"] = "failed"
         chunk["error"] = str(exc)
@@ -577,12 +583,14 @@ def regenerate_failed_chunks(
     whisper_device: str,
     validation_enabled: bool,
     validate_chunk_fn: Any = None,
+    progress: Any = None,
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
     if not validation_enabled:
         raise gr.Error("Enable Whisper validation first, or continue without validation.")
 
+    prog = progress if callable(progress) else (lambda *args, **kwargs: None)
     target_model = session.get("model_name") or model_name
     ensure_model_consistency(session, target_model)
 
@@ -593,6 +601,7 @@ def regenerate_failed_chunks(
     if not failed:
         raise gr.Error("No chunks currently need review.")
 
+    prog(0.05, desc=f"Regenerating {len(failed)} chunk(s) needing review...")
     session["model_name"] = target_model
     ui_settings = collect_generation_settings(
         temperature, seed_num, min_p, top_p, top_k, repetition_penalty, exaggeration, cfg_weight, norm_loudness
@@ -601,7 +610,8 @@ def regenerate_failed_chunks(
     devices = available_generation_devices(bool(enable_parallel), int(max_parallel_devices or 1))
     model_cache, adapter = get_model_adapter(model_cache, target_model, devices[0])
 
-    for chunk in failed:
+    for idx, chunk in enumerate(failed, start=1):
+        prog(idx / len(failed), desc=f"Regenerating chunk {chunk.get('id') or chunk['index']} ({idx}/{len(failed)})...")
         chunk["status"] = "generating"
         chunk["validation_status"] = None
         try:
@@ -618,6 +628,7 @@ def regenerate_failed_chunks(
             chunk["error"] = str(exc)
             save_session(session)
 
+    prog(1.0, desc=f"Finished regenerating {len(failed)} chunk(s).")
     return (
         session,
         model_cache,

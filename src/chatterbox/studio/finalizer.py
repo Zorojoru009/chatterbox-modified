@@ -29,11 +29,15 @@ def merge_chunks(
     require_approved: bool,
     export_mp3: bool,
     mp3_bitrate: str,
+    progress: Any = None,
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
     if ta is None:
         raise gr.Error("torchaudio is required to merge chunks but is not available.")
+
+    prog = progress if callable(progress) else (lambda *args, **kwargs: None)
+    prog(0.05, desc="Checking session chunks for export...")
 
     existing_models = {
         chunk.get("model_name")
@@ -64,7 +68,8 @@ def merge_chunks(
 
     waves = []
     sr = None
-    for chunk in selected_chunks:
+    for idx, chunk in enumerate(selected_chunks, start=1):
+        prog(0.1 + 0.6 * (idx / len(selected_chunks)), desc=f"Loading audio {idx}/{len(selected_chunks)}...")
         wav, chunk_sr = ta.load(chunk["audio_path"])
         if sr is None:
             sr = chunk_sr
@@ -81,6 +86,7 @@ def merge_chunks(
     if waves and float(silence_ms or 0) > 0:
         waves = waves[:-1]
 
+    prog(0.75, desc="Concatenating and saving master WAV...")
     final_wav = torch.cat(waves, dim=1)
     final_path = session_dir(session) / "final" / filename
     final_path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +95,7 @@ def merge_chunks(
 
     mp3_path = None
     if export_mp3:
+        prog(0.85, desc=f"Exporting MP3 at {mp3_bitrate}...")
         ffmpeg_path = shutil.which("ffmpeg")
         if not ffmpeg_path:
             raise gr.Error("MP3 export requires ffmpeg. Disable MP3 export or install ffmpeg in the runtime environment.")
@@ -116,6 +123,7 @@ def merge_chunks(
         session["final_mp3_path"] = str(mp3_path)
 
     save_session(session)
+    prog(1.0, desc="Master narration export complete!")
     return (
         session,
         str(final_path),

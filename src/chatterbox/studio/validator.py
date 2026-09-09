@@ -629,14 +629,18 @@ def check_audio_selected(
     min_duration_s: float,
     max_duration_s: float,
     min_rms_dbfs: float,
+    progress: Any = None,
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
+    prog = progress if callable(progress) else (lambda *args, **kwargs: None)
+    prog(0.2, desc=f"Analyzing audio quality for chunk {chunk_number}...")
     chunk = get_chunk(session, int(chunk_number or 1))
     result = check_audio_quality(
         session, chunk, silence_threshold_db, max_silence_ms, max_clip_fraction, min_duration_s, max_duration_s, min_rms_dbfs
     )
     save_session(session)
+    prog(1.0, desc=f"Chunk {chunk['index']} audio check: {'passed' if result['passed'] else 'needs review'}.")
     return (
         session,
         format_chunk_table(session),
@@ -691,14 +695,18 @@ def validate_selected_chunk(
     whisper_device: str,
     validation_threshold: float,
     enabled: bool,
+    progress: Any = None,
 ):
     if not session:
         raise gr.Error("Create or load a session first.")
     if not enabled:
         raise gr.Error("Enable Whisper validation first, or continue without validation.")
+    prog = progress if callable(progress) else (lambda *args, **kwargs: None)
+    prog(0.2, desc=f"Validating chunk {chunk_number} with {whisper_model_name}...")
     chunk = get_chunk(session, int(chunk_number or 1))
     result = validate_chunk(session, chunk, whisper_model_name, whisper_device, float(validation_threshold))
     save_session(session)
+    prog(1.0, desc=f"Chunk {chunk['index']} validated: {chunk['validation_status']}.")
     diag_cat = result.get("diagnostic_category")
     diag_suffix = f" ({diag_cat})" if diag_cat and diag_cat != "passed" else ""
     return (

@@ -614,9 +614,15 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             ],
         )
 
-        # Generate All Chunks
-        generate_all_btn.click(
-            fn=lambda session, cache, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl, ep, mpd, se, ve, ar, wm, wd, vt: generate_all_chunks(
+        # Progress default hook helper
+        prog_hook = gr.Progress(track_tqdm=True) if gr is not None else None
+
+        # Generate All Chunks (with live progress tracking)
+        def on_generate_all(
+            session, cache, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl, ep, mpd, se, ve, ar, wm, wd, vt,
+            progress=prog_hook,
+        ):
+            return generate_all_chunks(
                 session=session,
                 model_cache=cache,
                 model_name=model,
@@ -638,8 +644,12 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 whisper_model_name=wm,
                 whisper_device=wd,
                 validation_threshold=vt,
+                progress=progress,
                 auto_validate_fn=auto_validate_and_regenerate_callback,
-            ),
+            )
+
+        generate_all_btn.click(
+            fn=on_generate_all,
             inputs=[
                 session_state,
                 model_cache_state,
@@ -698,9 +708,12 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=[session_state, chunk_table, chunk_audio, chunk_transcript, chunk_validation, global_status],
         )
 
-        # Generate Selected Chunk (Strictly honors blueprint chunk settings)
-        generate_selected_btn.click(
-            fn=lambda session, cache, num, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl: generate_selected_chunk(
+        # Generate Selected Chunk (with live progress tracking)
+        def on_generate_selected(
+            session, cache, num, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl,
+            progress=prog_hook,
+        ):
+            return generate_selected_chunk(
                 session=session,
                 model_cache=cache,
                 chunk_number=num,
@@ -716,7 +729,11 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 cfg_weight=cfg,
                 norm_loudness=nl,
                 validation_details_fn=validation_details,
-            ),
+                progress=progress,
+            )
+
+        generate_selected_btn.click(
+            fn=on_generate_selected,
             inputs=[
                 session_state,
                 model_cache_state,
@@ -748,21 +765,51 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=[session_state, chunk_table, global_status],
         )
 
-        # Validation & Audio Checks
+        # Validation & Audio Checks (with live progress tracking)
+        def on_validate_selected(
+            session, num, wm, wd, vt, ve,
+            progress=prog_hook,
+        ):
+            return validate_selected_chunk(
+                session=session,
+                chunk_number=num,
+                whisper_model_name=wm,
+                whisper_device=wd,
+                validation_threshold=vt,
+                enabled=ve,
+                progress=progress,
+            )
+
         validate_selected_btn.click(
-            fn=validate_selected_chunk,
+            fn=on_validate_selected,
             inputs=[session_state, chunk_number, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
             outputs=[session_state, chunk_table, chunk_transcript, chunk_validation, global_status],
         )
 
+        def on_validate_all(
+            session, wm, wd, vt, ve,
+            progress=prog_hook,
+        ):
+            return validate_all_chunks(
+                session=session,
+                whisper_model_name=wm,
+                whisper_device=wd,
+                validation_threshold=vt,
+                enabled=ve,
+                progress=progress,
+            )
+
         validate_all_btn.click(
-            fn=validate_all_chunks,
+            fn=on_validate_all,
             inputs=[session_state, whisper_model_name, whisper_device, validation_threshold, validation_enabled],
             outputs=[session_state, chunk_table, global_status],
         )
 
-        regenerate_failed_btn.click(
-            fn=lambda session, cache, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl, ep, mpd, vt, wm, wd, ve: regenerate_failed_chunks(
+        def on_regenerate_failed(
+            session, cache, model, ref, t, s, mp, tp, tk, rp, ex, cfg, nl, ep, mpd, vt, wm, wd, ve,
+            progress=prog_hook,
+        ):
+            return regenerate_failed_chunks(
                 session=session,
                 model_cache=cache,
                 model_name=model,
@@ -783,7 +830,11 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 whisper_device=wd,
                 validation_enabled=ve,
                 validate_chunk_fn=validate_chunk,
-            ),
+                progress=progress,
+            )
+
+        regenerate_failed_btn.click(
+            fn=on_regenerate_failed,
             inputs=[
                 session_state,
                 model_cache_state,
@@ -808,8 +859,24 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=[session_state, model_cache_state, chunk_table, global_status],
         )
 
+        def on_check_audio_selected(
+            session, num, st, ms, cf, mind, maxd, mrms,
+            progress=prog_hook,
+        ):
+            return check_audio_selected(
+                session=session,
+                chunk_number=num,
+                silence_threshold_db=st,
+                max_silence_ms=ms,
+                max_clip_fraction=cf,
+                min_duration_s=mind,
+                max_duration_s=maxd,
+                min_rms_dbfs=mrms,
+                progress=progress,
+            )
+
         check_audio_selected_btn.click(
-            fn=check_audio_selected,
+            fn=on_check_audio_selected,
             inputs=[
                 session_state,
                 chunk_number,
@@ -823,8 +890,23 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=[session_state, chunk_table, chunk_validation, global_status],
         )
 
+        def on_check_audio_all(
+            session, st, ms, cf, mind, maxd, mrms,
+            progress=prog_hook,
+        ):
+            return check_audio_all(
+                session=session,
+                silence_threshold_db=st,
+                max_silence_ms=ms,
+                max_clip_fraction=cf,
+                min_duration_s=mind,
+                max_duration_s=maxd,
+                min_rms_dbfs=mrms,
+                progress=progress,
+            )
+
         check_audio_all_btn.click(
-            fn=check_audio_all,
+            fn=on_check_audio_all,
             inputs=[
                 session_state,
                 silence_threshold_db,
@@ -862,9 +944,23 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=[model_cache_state, global_status, model_load_status],
         )
 
-        # Finalize & Merge
+        # Finalize & Merge (with live progress tracking)
+        def on_merge_chunks(
+            session, fn, sms, req_appr, exp_mp3, mp3_br,
+            progress=prog_hook,
+        ):
+            return merge_chunks(
+                session=session,
+                output_filename=fn,
+                silence_ms=sms,
+                require_approved=req_appr,
+                export_mp3=exp_mp3,
+                mp3_bitrate=mp3_br,
+                progress=progress,
+            )
+
         merge_btn.click(
-            fn=merge_chunks,
+            fn=on_merge_chunks,
             inputs=[session_state, output_filename, silence_ms, require_approved, export_mp3, mp3_bitrate],
             outputs=[session_state, final_file, final_audio, final_mp3_file, global_status],
         )

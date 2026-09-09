@@ -523,6 +523,38 @@ class StudioUnitTests(unittest.TestCase):
                 self.assertEqual(kwargs["compression_ratio_threshold"], 2.6)
                 self.assertEqual(kwargs["no_speech_threshold"], 0.4)
 
+    def test_trim_silence_boundary(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch is not installed in this environment")
+        from chatterbox.studio.finalizer import trim_silence_boundary
+
+        sr = 16000
+        # Create 1 second of silence, 1 second of tone, 1 second of internal silence, 1 second of tone, 2 seconds of silence
+        # Total: 6 seconds (96,000 samples)
+        head_silence = torch.zeros(1, sr)
+        tone1 = torch.sin(torch.linspace(0, 100 * 3.14159, sr)).unsqueeze(0) * 0.5
+        pause = torch.zeros(1, sr)  # Internal 1-second pause
+        tone2 = torch.sin(torch.linspace(0, 100 * 3.14159, sr)).unsqueeze(0) * 0.5
+        tail_silence = torch.zeros(1, 2 * sr)  # 2 seconds trailing silence
+
+        wav = torch.cat([head_silence, tone1, pause, tone2, tail_silence], dim=1)
+        self.assertEqual(wav.shape[1], 6 * sr)
+
+        trimmed = trim_silence_boundary(wav, sr, threshold_db=-40.0, head_pad_ms=50.0, tail_pad_ms=120.0)
+
+        # Head pad is 50ms (800 samples), tail pad is 120ms (1920 samples)
+        # Content duration: tone1 (1s) + pause (1s) + tone2 (1s) = 3s (48000 samples)
+        # Expected duration: ~48000 + 800 + 1920 = ~50720 samples (~3.17s)
+        self.assertLess(trimmed.shape[1], 3.25 * sr)
+        self.assertGreater(trimmed.shape[1], 3.10 * sr)
+
+        # All-silent audio should not crash and should return original
+        all_silent = torch.zeros(1, sr)
+        res_silent = trim_silence_boundary(all_silent, sr)
+        self.assertEqual(res_silent.shape[1], sr)
+
 
 
 if __name__ == "__main__":

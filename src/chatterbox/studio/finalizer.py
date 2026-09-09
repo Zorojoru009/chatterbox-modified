@@ -19,7 +19,136 @@ except Exception:
     ta = None
 
 from .config import safe_wav_filename
-from .session import save_session, session_dir, status_message
+from .session import format_chunk_table, get_chunk, save_session, session_dir, status_message
+
+
+def trim_silence_boundary(
+    wav: torch.Tensor,
+    sample_rate: int,
+    threshold_db: float = -45.0,
+    head_pad_ms: float = 40.0,
+    tail_pad_ms: float = 120.0,
+) -> torch.Tensor:
+    """Trim leading and trailing digital dead air while preserving internal pauses and natural tail decay."""
+    if wav.numel() == 0:
+        return wav
+
+    mono = wav.abs().max(dim=0).values
+    silence_amp = 10.0 ** (float(threshold_db) / 20.0)
+    audible = mono > silence_amp
+
+    if not audible.any():
+        return wav
+
+    first_idx = int(torch.argmax(audible.int()).item())
+    reversed_audible = audible.flip(dims=[0])
+    last_idx = int(len(audible) - 1 - torch.argmax(reversed_audible.int()).item())
+
+    head_pad = int((float(head_pad_ms) / 1000.0) * sample_rate)
+    tail_pad = int((float(tail_pad_ms) / 1000.0) * sample_rate)
+
+    start = max(0, first_idx - head_pad)
+    end = min(wav.shape[-1], last_idx + 1 + tail_pad)
+
+    trimmed = wav[..., start:end].clone()
+
+    fade_len = min(int(0.005 * sample_rate), trimmed.shape[-1])
+    if fade_len > 1:
+        fade_out = torch.linspace(1.0, 0.0, fade_len, dtype=trimmed.dtype, device=trimmed.device)
+        trimmed[..., -fade_len:] *= fade_out
+        fade_in = torch.linspace(0.0, 1.0, fade_len, dtype=trimmed.dtype, device=trimmed.device)
+        trimmed[..., :fade_len] *= fade_in
+
+    return trimmed
+
+
+def trim_chunk_audio(
+    session: dict[str, Any],
+    chunk_number: int,
+    threshold_db: float = -45.0,
+    head_pad_ms: float = 40.0,
+    tail_pad_ms: float = 120.0,
+) -> tuple[dict[str, Any], list[list[Any]], str | None, str, str]:
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    if ta is None:
+        raise gr.Error("torchaudio is required to trim audio.")
+
+    chunk = get_chunk(session, int(chunk_number or 1))
+    audio_path = chunk.get("audio_path")
+    if not audio_path or not Path(audio_path).exists():
+        raise gr.Error("Chunk has no generated audio to trim.")
+
+    wav, sr = ta.load(audio_path)
+    trimmed = trim_silence_boundary(wav, sr, threshold_db, head_pad_ms, tail_pad_ms)
+    ta.save(audio_path, trimmed, sr)
+
+    from .validator import check_audio_quality, validation_details
+    check_audio_quality(
+        session,
+        chunk,
+        silence_threshold_db=threshold_db,
+        max_silence_ms=600.0,
+        max_clip_fraction=0.001,
+        min_duration_s=0.20,
+        max_duration_s=120.0,
+        min_rms_dbfs=-38.0,
+    )
+    save_session(session)
+    return (
+        session,
+        format_chunk_table(session),
+        audio_path,
+        validation_details(chunk),
+        status_message(session, f"Auto-trimmed dead air on chunk {chunk.get('id') or chunk['index']}. Acoustic checks updated."),
+    )
+
+
+def trim_all_chunks_audio(
+    session: dict[str, Any],
+    threshold_db: float = -45.0,
+    head_pad_ms: float = 40.0,
+    tail_pad_ms: float = 120.0,
+    progress: Any = None,
+) -> tuple[dict[str, Any], list[list[Any]], str]:
+    if not session:
+        raise gr.Error("Create or load a session first.")
+    if ta is None:
+        raise gr.Error("torchaudio is required to trim audio.")
+
+    prog = progress if callable(progress) else (lambda *args, **kwargs: None)
+    chunks = [c for c in session.get("chunks", []) if c.get("audio_path") and c["status"] != "excluded"]
+    if not chunks:
+        raise gr.Error("No audio chunks available to trim.")
+
+    from .validator import check_audio_quality
+    trimmed_count = 0
+    for idx, chunk in enumerate(chunks, start=1):
+        prog(idx / len(chunks), desc=f"Trimming dead air on chunk {idx}/{len(chunks)}...")
+        p = chunk.get("audio_path")
+        if p and Path(p).exists():
+            wav, sr = ta.load(p)
+            trimmed = trim_silence_boundary(wav, sr, threshold_db, head_pad_ms, tail_pad_ms)
+            ta.save(p, trimmed, sr)
+            check_audio_quality(
+                session,
+                chunk,
+                silence_threshold_db=threshold_db,
+                max_silence_ms=600.0,
+                max_clip_fraction=0.001,
+                min_duration_s=0.20,
+                max_duration_s=120.0,
+                min_rms_dbfs=-38.0,
+            )
+            trimmed_count += 1
+
+    save_session(session)
+    prog(1.0, desc=f"Trimmed {trimmed_count} chunk(s). All acoustic checks updated.")
+    return (
+        session,
+        format_chunk_table(session),
+        status_message(session, f"Auto-trimmed dead air on {trimmed_count} chunk(s). All acoustic checks updated."),
+    )
 
 
 def merge_chunks(
@@ -29,6 +158,7 @@ def merge_chunks(
     require_approved: bool,
     export_mp3: bool,
     mp3_bitrate: str,
+    smart_trim: bool = True,
     progress: Any = None,
 ):
     if not session:
@@ -77,6 +207,8 @@ def merge_chunks(
             raise gr.Error(f"Chunk {chunk['index']} sample rate {chunk_sr} does not match project sample rate {sr}.")
         if wav.ndim == 1:
             wav = wav.unsqueeze(0)
+        if smart_trim:
+            wav = trim_silence_boundary(wav, sr)
         waves.append(wav)
         gap_samples = int((float(silence_ms or 0) / 1000.0) * sr)
         if gap_samples > 0:

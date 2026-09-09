@@ -40,7 +40,7 @@ from .engine import (
     regenerate_failed_chunks,
     warm_model_cache,
 )
-from .finalizer import merge_chunks
+from .finalizer import merge_chunks, trim_all_chunks_audio, trim_chunk_audio
 from .session import (
     chunk_script,
     copy_reference_to_session,
@@ -537,6 +537,7 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                         chunk_validation = gr.Markdown("This chunk has not been validated yet.")
                         with gr.Row():
                             generate_selected_btn = gr.Button("⚡ Generate Selected Chunk", variant="primary")
+                            trim_chunk_btn = gr.Button("✂️ Auto-Trim Silence")
                             approve_btn = gr.Button("✅ Approve")
                             exclude_btn = gr.Button("⛔ Exclude")
 
@@ -570,7 +571,7 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                     gr.Markdown("#### Acoustic Audio Checks")
                     with gr.Row():
                         silence_threshold_db = gr.Slider(-60, -20, step=1, value=-45, label="Silence threshold (dBFS)")
-                        max_silence_ms = gr.Slider(0, 2000, step=50, value=250, label="Max leading/trailing silence (ms)")
+                        max_silence_ms = gr.Slider(0, 2000, step=50, value=600, label="Max leading/trailing silence (ms)")
                         max_clip_fraction = gr.Slider(0, 0.01, step=0.0005, value=0.001, label="Max clipping fraction")
                         min_duration_s = gr.Slider(0.05, 5, step=0.05, value=0.20, label="Min chunk duration (s)")
                         max_duration_s = gr.Slider(5, 180, step=1, value=120, label="Max chunk duration (s)")
@@ -578,6 +579,7 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                     with gr.Row():
                         check_audio_selected_btn = gr.Button("Check Audio Selected")
                         check_audio_all_btn = gr.Button("Check Audio All")
+                        trim_all_btn = gr.Button("✂️ Auto-Trim Dead Air (All Chunks)", variant="secondary")
                         export_report_btn = gr.Button("Export Validation Report JSON")
                     validation_report_file = gr.File(label="Exported Validation Report")
 
@@ -585,6 +587,7 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                     with gr.Row():
                         output_filename = gr.Textbox(value="narration.wav", label="Final Output Filename")
                         silence_ms = gr.Slider(0, 1000, step=25, value=200, label="Silence between chunks (ms)")
+                        smart_trim = gr.Checkbox(value=True, label="Smart Trim Dead Air", info="Auto-normalizes trailing dead air on merge (preserves ~120ms natural decay).")
                         require_approved = gr.Checkbox(value=False, label="Require all chunks approved")
                         export_mp3 = gr.Checkbox(value=False, label="Also export MP3")
                         mp3_bitrate = gr.Dropdown(["128k", "192k", "256k", "320k"], value="192k", label="MP3 bitrate")
@@ -848,6 +851,16 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=scorecard_outputs,
         )
 
+        trim_chunk_btn.click(
+            fn=trim_chunk_audio,
+            inputs=[session_state, chunk_number, silence_threshold_db],
+            outputs=[session_state, chunk_table, chunk_audio, chunk_validation, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
+        )
+
         approve_btn.click(
             fn=approve_selected_chunk,
             inputs=[session_state, chunk_number],
@@ -1073,6 +1086,19 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
             outputs=scorecard_outputs,
         )
 
+        def on_trim_all(session, st, progress=prog_hook):
+            return trim_all_chunks_audio(session, threshold_db=st, progress=progress)
+
+        trim_all_btn.click(
+            fn=on_trim_all,
+            inputs=[session_state, silence_threshold_db],
+            outputs=[session_state, chunk_table, global_status],
+        ).then(
+            fn=update_validation_scorecard,
+            inputs=[session_state],
+            outputs=scorecard_outputs,
+        )
+
         export_report_btn.click(
             fn=export_validation_report,
             inputs=[session_state],
@@ -1100,7 +1126,7 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
 
         # Finalize & Merge (with live progress tracking)
         def on_merge_chunks(
-            session, fn, sms, req_appr, exp_mp3, mp3_br,
+            session, fn, sms, req_appr, exp_mp3, mp3_br, sm_trim,
             progress=prog_hook,
         ):
             return merge_chunks(
@@ -1110,12 +1136,13 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                 require_approved=req_appr,
                 export_mp3=exp_mp3,
                 mp3_bitrate=mp3_br,
+                smart_trim=sm_trim,
                 progress=progress,
             )
 
         merge_btn.click(
             fn=on_merge_chunks,
-            inputs=[session_state, output_filename, silence_ms, require_approved, export_mp3, mp3_bitrate],
+            inputs=[session_state, output_filename, silence_ms, require_approved, export_mp3, mp3_bitrate, smart_trim],
             outputs=[session_state, final_file, final_audio, final_mp3_file, global_status],
         )
 

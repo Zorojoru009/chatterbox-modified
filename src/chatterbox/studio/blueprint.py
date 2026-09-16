@@ -145,6 +145,14 @@ def validate_narration_blueprint(blueprint: Any) -> str | None:
                 return f"Duplicate chunk ID `{cid_str}` found at chunk index {index}."
             seen_ids.add(cid_str)
 
+        if "pause_after_ms" in entry and entry["pause_after_ms"] is not None:
+            try:
+                pause_val = float(entry["pause_after_ms"])
+                if pause_val < 0 or pause_val > 10000:
+                    return f"chunks[{index}] invalid `pause_after_ms`: {pause_val} (must be between 0 and 10000 ms)."
+            except (ValueError, TypeError):
+                return f"chunks[{index}] invalid `pause_after_ms`: {entry['pause_after_ms']!r}"
+
     # Optional merge configuration validation
     if "merge" in blueprint and isinstance(blueprint["merge"], dict):
         merge_cfg = blueprint["merge"]
@@ -194,6 +202,7 @@ def make_session_from_blueprint(blueprint: dict[str, Any]) -> dict[str, Any]:
                 "error": None,
                 "model_name": entry_model,
                 "device": None,
+                "pause_after_ms": float(entry["pause_after_ms"]) if entry.get("pause_after_ms") is not None else None,
                 "settings": normalize_blueprint_settings(
                     entry.get("settings", {}), entry_model, base=default_settings
                 ),
@@ -266,6 +275,7 @@ def export_blueprint_from_session(session: dict[str, Any]) -> dict[str, Any]:
                 "id": chunk.get("id", f"chunk{chunk['index']:04d}"),
                 "note": chunk.get("note", ""),
                 "text": chunk.get("text", ""),
+                "pause_after_ms": chunk.get("pause_after_ms"),
                 "model": chunk.get("model_name"),
                 "settings": chunk.get("settings"),
             }

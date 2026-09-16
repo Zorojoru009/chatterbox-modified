@@ -210,13 +210,15 @@ def merge_chunks(
         if smart_trim:
             wav = trim_silence_boundary(wav, sr)
         waves.append(wav)
-        gap_samples = int((float(silence_ms or 0) / 1000.0) * sr)
-        if gap_samples > 0:
-            waves.append(torch.zeros((wav.shape[0], gap_samples), dtype=wav.dtype))
-
-    # Remove the trailing silence gap if added
-    if waves and float(silence_ms or 0) > 0:
-        waves = waves[:-1]
+        
+        # Append silence gap between chunks (never after the final chunk)
+        if idx < len(selected_chunks):
+            chunk_pause_ms = chunk.get("pause_after_ms")
+            if chunk_pause_ms is None:
+                chunk_pause_ms = silence_ms
+            gap_samples = int((float(chunk_pause_ms or 0) / 1000.0) * sr)
+            if gap_samples > 0:
+                waves.append(torch.zeros((wav.shape[0], gap_samples), dtype=wav.dtype))
 
     prog(0.75, desc="Concatenating and saving master WAV...")
     final_wav = torch.cat(waves, dim=1)

@@ -281,7 +281,7 @@ def generate_chunk_wav(
             temperature=float(settings["temperature"]),
             min_p=float(settings["min_p"]),
             top_p=float(settings["top_p"]),
-            top_k=int(settings["top_k"]),
+            top_k=int(settings.get("top_k") or 1000),
             repetition_penalty=float(settings["repetition_penalty"]),
             exaggeration=float(settings["exaggeration"]),
             cfg_weight=float(settings["cfg_weight"]),

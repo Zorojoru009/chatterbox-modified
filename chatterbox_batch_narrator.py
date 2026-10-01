@@ -189,7 +189,7 @@ def _narrator_worker(
                             repetition_penalty=float(settings.get("repetition_penalty", 1.2)),
                             min_p=float(settings.get("min_p", 0.00)),
                             top_p=float(settings.get("top_p", 0.95)),
-                            top_k=int(settings.get("top_k", 1000)),
+                            top_k=int(settings.get("top_k") or 1000),
                             temperature=float(settings.get("temperature", 0.8)),
                             norm_loudness=bool(settings.get("norm_loudness", True)),
                             apply_watermark=apply_watermark,

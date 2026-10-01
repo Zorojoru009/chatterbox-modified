@@ -124,6 +124,7 @@ class ModelAdapter:
         exaggeration: float,
         cfg_weight: float,
         norm_loudness: bool,
+        apply_watermark: bool = False,
     ) -> torch.Tensor:
         with self.lock:
             # Ensure reference voice conditionals are loaded and cached
@@ -145,6 +146,7 @@ class ModelAdapter:
                     min_p=min_p,
                     top_p=top_p,
                     repetition_penalty=repetition_penalty,
+                    apply_watermark=apply_watermark,
                 )
 
             return self.model.generate(
@@ -155,6 +157,7 @@ class ModelAdapter:
                 top_k=int(top_k),
                 repetition_penalty=repetition_penalty,
                 norm_loudness=norm_loudness,
+                apply_watermark=apply_watermark,
             )
 
 
@@ -243,6 +246,7 @@ def collect_generation_settings(
     exaggeration: float,
     cfg_weight: float,
     norm_loudness: bool,
+    apply_watermark: bool = False,
 ) -> dict[str, Any]:
     return {
         "temperature": float(temperature),
@@ -254,6 +258,7 @@ def collect_generation_settings(
         "exaggeration": float(exaggeration),
         "cfg_weight": float(cfg_weight),
         "norm_loudness": bool(norm_loudness),
+        "apply_watermark": bool(apply_watermark),
     }
 
 
@@ -281,6 +286,7 @@ def generate_chunk_wav(
             exaggeration=float(settings["exaggeration"]),
             cfg_weight=float(settings["cfg_weight"]),
             norm_loudness=bool(settings["norm_loudness"]),
+            apply_watermark=bool(settings.get("apply_watermark", False)),
         )
     return wav.cpu(), adapter.sr, adapter.device
 

@@ -23,7 +23,7 @@ Run this in the first Kaggle notebook cell before importing Chatterbox:
 !pip uninstall -y torchvision
 
 # 2. Install required dependencies
-!pip install -q faster-whisper torchaudio soundfile librosa
+!pip install -q "faster-whisper>=1.1.0" torchaudio soundfile librosa
 ```
 
 > **Note:** If Kaggle prompts that packages were already imported, click **Restart Session / Kernel**.

@@ -1,7 +1,6 @@
 import json
 import re
 import threading
-from collections import Counter
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -123,7 +122,59 @@ CONTRACTIONS = {
     r"\bok\b": "okay",
 }
 
-FILLER_WORDS = {"um", "uh", "er", "ah", "hmm", "hm"}
+FILLER_WORDS = {"um", "uh", "er", "ah", "hmm", "hm", "mm", "mhm", "ha", "haha", "hahaha", "heh"}
+
+# Spoken-form abbreviations, applied symmetrically so "Dr." and "Doctor" compare equal
+ABBREVIATIONS = {
+    r"\bdr\b": "doctor",
+    r"\bmr\b": "mister",
+    r"\bmrs\b": "missus",
+    r"\bprof\b": "professor",
+    r"\bvs\b": "versus",
+    r"\betc\b": "et cetera",
+    r"\bapprox\b": "approximately",
+}
+
+ROMAN_NUMERALS = {
+    "II": 2, "III": 3, "IV": 4, "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "XI": 11, "XII": 12,
+    "XIII": 13, "XIV": 14, "XV": 15, "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19, "XX": 20,
+}
+
+UNIT_WORDS = {
+    "kg": "kilograms", "km": "kilometers", "cm": "centimeters", "mm": "millimeters",
+    "mg": "milligrams", "ml": "milliliters", "lb": "pounds", "lbs": "pounds", "ft": "feet",
+    "mph": "miles per hour", "kph": "kilometers per hour", "gb": "gigabytes", "mb": "megabytes",
+    "tb": "terabytes", "ghz": "gigahertz", "mhz": "megahertz", "kw": "kilowatts",
+}
+
+CURRENCY_UNITS = {
+    "$": ("dollar", "dollars", "cent", "cents"),
+    "£": ("pound", "pounds", "penny", "pence"),
+    "€": ("euro", "euros", "cent", "cents"),
+}
+SCALE_ALIASES = {"k": "thousand", "m": "million", "bn": "billion"}
+
+# Spelled-out number words; a dropped or changed one fails the chunk on its own
+NUMBER_WORDS = set(ONES[1:]) | set(TENS[2:]) | {"zero", "hundred", "thousand", "million", "billion", "trillion"}
+
+NUMBER_SLOT_RE = re.compile(r"^zslot([a-y]+)z$")
+
+# Whisper models offered in the UI. large-v3-turbo needs faster-whisper>=1.1.
+WHISPER_MODEL_CHOICES = [
+    "large-v3-turbo",
+    "distil-large-v3",
+    "large-v3",
+    "medium.en",
+    "small.en",
+    "base.en",
+    "tiny.en",
+]
+DEFAULT_WHISPER_MODEL_GPU = "large-v3-turbo"
+DEFAULT_WHISPER_MODEL_CPU = "small.en"
+
+# Minimum character similarity for two differing words to count as the same spoken word
+# (proper-noun spellings like "Kaelen"/"Kaylen", British/American "colour"/"color")
+FUZZY_WORD_THRESHOLD = 0.8
 
 
 def _small_int_to_words(n: int) -> str:
@@ -188,55 +239,211 @@ def int_to_ordinal_words(n: int) -> str:
     return " ".join(words)
 
 
-def normalize_validation_text(value: str, filter_fillers: bool = True) -> str:
-    """Spotless text normalization for Whisper ASR comparison.
-    
-    Expands numbers to words, ordinals, currency, percentages, contractions,
-    and removes Chatterbox event tags ([sigh], [laugh]) and common filler words (um, uh).
-    """
-    if not value:
-        return ""
+def _dedupe(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for item in items if item))
 
-    # Remove Chatterbox event tags e.g. [sigh], [laugh], [whisper]
-    value = re.sub(r"\[[^\]]+\]", " ", value)
+
+def _pluralize_last(words: str) -> str:
+    head, _, last = words.rpartition(" ")
+    last = last[:-1] + "ies" if last.endswith("y") else last + "s"
+    return f"{head} {last}".strip()
+
+
+def _digit_words(digits: str, zero: str) -> str:
+    return " ".join(zero if d == "0" else ONES[int(d)] for d in digits)
+
+
+def paired_digit_words(n: int) -> str:
+    """Read a 4-digit number in pairs, as years are spoken: 1999 -> nineteen ninety nine,
+    1905 -> nineteen oh five, 1900 -> nineteen hundred, 2024 -> twenty twenty four."""
+    hi, lo = divmod(n, 100)
+    hi_words = int_to_words(hi)
+    if lo == 0:
+        return f"{hi_words} hundred"
+    if lo < 10:
+        return f"{hi_words} oh {ONES[lo]}"
+    return f"{hi_words} {int_to_words(lo)}"
+
+
+def integer_spoken_variants(digits: str) -> list[str]:
+    """All common spoken forms of an integer; the first is the canonical cardinal.
+
+    e.g. 1999 -> "one thousand nine hundred ninety nine", "nineteen ninety nine";
+    2500 -> "twenty five hundred"; 1204 -> "twelve oh four"; 100 -> "a hundred".
+    """
+    n = int(digits)
+    cardinal = int_to_words(n)
+    variants = [
+        cardinal,
+        re.sub(r"hundred (?!thousand|million|billion)", "hundred and ", cardinal),
+        re.sub(r"^one (hundred|thousand|million|billion)", r"a \1", cardinal),
+    ]
+    if len(digits) == 4 and n >= 1000:
+        variants.append(paired_digit_words(n))
+    if digits.startswith("0") and len(digits) > 1 or len(digits) >= 5:
+        variants.append(_digit_words(digits, "oh"))
+        variants.append(_digit_words(digits, "zero"))
+    return _dedupe(variants)
+
+
+def decimal_spoken_variants(whole: str, frac: str) -> list[str]:
+    """e.g. 3.5 -> "three point five", "three and a half"; 0.5 -> "zero point five", "point five"."""
+    whole_words = int_to_words(int(whole))
+    frac_words = _digit_words(frac, "zero")
+    variants = [f"{whole_words} point {frac_words}", f"{whole_words} point {_digit_words(frac, 'oh')}"]
+    if int(whole) == 0:
+        variants.append(f"point {frac_words}")
+    fraction_names = {"5": "a half", "25": "a quarter", "75": "three quarters"}
+    if frac in fraction_names:
+        variants.append(f"{whole_words} and {fraction_names[frac]}")
+    return _dedupe(variants)
+
+
+def _number_spoken_variants(whole: str, frac: str | None) -> list[str]:
+    return decimal_spoken_variants(whole, frac) if frac else integer_spoken_variants(whole)
+
+
+def _slot_token(index: int) -> str:
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 25)
+        letters = chr(97 + rem) + letters
+    return f" zslot{letters}z "
+
+
+def _slot_index(token: str) -> int | None:
+    m = NUMBER_SLOT_RE.match(token)
+    if not m:
+        return None
+    index = 0
+    for ch in m.group(1):
+        index = index * 25 + (ord(ch) - 97 + 1)
+    return index - 1
+
+
+def _normalize_tokens(value: str, filter_fillers: bool) -> tuple[list[str], list[list[str]]]:
+    """Normalize text into words, leaving each number as a slot token with its spoken variants."""
+    if not value:
+        return [], []
+    slots: list[list[str]] = []
+
+    def slot(variants: list[str]) -> str:
+        slots.append(variants)
+        return _slot_token(len(slots) - 1)
+
+    # Remove Chatterbox event tags e.g. [sigh], [laugh], [whisper], and the ASR's own
+    # non-speech annotations for them e.g. (laughs), *sighs*, ♪
+    value = re.sub(r"\[[^\]]+\]|\([^)]*\)|\*[^*]+\*|[♪♫]", " ", value)
+
+    # Uppercase Roman numerals e.g. World War II, Henry VIII (before lowercasing loses the signal)
+    def _roman_sub(m: re.Match) -> str:
+        n = ROMAN_NUMERALS[m.group(0)]
+        return slot([int_to_words(n), int_to_ordinal_words(n), f"the {int_to_ordinal_words(n)}"])
+
+    value = re.sub(r"\b(?:" + "|".join(sorted(ROMAN_NUMERALS, key=len, reverse=True)) + r")\b", _roman_sub, value)
     value = value.lower().replace("’", "'")
 
-    # Symmetrically expand contractions
+    # Collapse dotted acronyms e.g. U.S. -> us, A.I. -> ai (matches Whisper's "US", "AI")
+    value = re.sub(r"\b(?:[a-z]\.){2,}", lambda m: m.group(0).replace(".", ""), value)
+
+    # Symmetrically expand contractions and spoken abbreviations
     for pat, repl in CONTRACTIONS.items():
+        value = re.sub(pat, repl, value)
+    for pat, repl in ABBREVIATIONS.items():
         value = re.sub(pat, repl, value)
 
     # Remove commas between digits e.g. 1,000 -> 1000
-    value = re.sub(r"(\d),(\d)", r"\1\2", value)
+    value = re.sub(r"(\d),(?=\d{3}\b)", r"\1", value)
 
-    # Currency e.g. $50 or $50.25 or $1
+    # Units attached to numbers e.g. 5kg -> 5 kilograms
+    value = re.sub(
+        r"(\d)\s*(" + "|".join(sorted(UNIT_WORDS, key=len, reverse=True)) + r")\b",
+        lambda m: f"{m.group(1)} {UNIT_WORDS[m.group(2)]}",
+        value,
+    )
+
+    # Currency e.g. $50, $50.25, £3, $1.5 million, $20k
     def _curr_sub(m: re.Match) -> str:
-        dollars = int(m.group(1))
-        cents = m.group(2)
-        d_word = "one dollar" if dollars == 1 else f"{int_to_words(dollars)} dollars"
-        if cents and int(cents) > 0:
-            c_val = int(cents)
-            c_word = "one cent" if c_val == 1 else f"{int_to_words(c_val)} cents"
-            return f"{d_word} and {c_word}"
-        return d_word
+        unit, units, sub_unit, sub_units = CURRENCY_UNITS[m.group(1)]
+        whole, frac, scale = m.group(2), m.group(3), m.group(4)
+        if scale:
+            scale = SCALE_ALIASES.get(scale, scale)
+            return slot([f"{amount} {scale} {units}" for amount in _number_spoken_variants(whole, frac)])
+        main = unit if int(whole) == 1 else units
+        variants = [f"{amount} {main}" for amount in integer_spoken_variants(whole)]
+        if frac and len(frac) <= 2 and int(frac) > 0:
+            cents_val = int(frac.ljust(2, "0"))
+            cents_words = int_to_words(cents_val)
+            sub = sub_unit if cents_val == 1 else sub_units
+            whole_words = int_to_words(int(whole))
+            variants = [
+                f"{whole_words} {main} and {cents_words} {sub}",
+                f"{whole_words} {main} {cents_words} {sub}",
+                f"{whole_words} {main} {cents_words}",
+                f"{whole_words} {cents_words}",
+            ] + [f"{amount} {units}" for amount in decimal_spoken_variants(whole, frac)]
+        return slot(_dedupe(variants))
 
-    value = re.sub(r"\$(\d+)(?:\.(\d{1,2}))?", _curr_sub, value)
+    value = re.sub(
+        r"([$£€])(\d+)(?:\.(\d+))?(?:\s*(thousand|million|billion|trillion|bn|k|m)\b)?", _curr_sub, value
+    )
 
     # Percentages e.g. 50% -> 50 percent
-    value = re.sub(r"(\d+)\s*%", r"\1 percent", value)
+    value = re.sub(r"(\d)\s*%", r"\1 percent", value)
+
+    # Decades e.g. 1990s, '90s -> nineteen nineties, nineties
+    def _decade_sub(m: re.Match) -> str:
+        digits = m.group(1)
+        n = int(digits)
+        if len(digits) == 4:
+            hi, lo = divmod(n, 100)
+            hi_words = int_to_words(hi)
+            first = f"{hi_words} hundreds" if lo == 0 else f"{hi_words} {_pluralize_last(int_to_words(lo))}"
+            return slot(_dedupe([first, _pluralize_last(int_to_words(n))]))
+        return slot([_pluralize_last(int_to_words(n))])
+
+    value = re.sub(r"(?<![\w.])'?(\d{1,3}0)'?s\b", _decade_sub, value)
+
+    # Times e.g. 10:30 -> ten thirty, 10:05 -> ten oh five, 10:00 -> ten o clock
+    def _time_sub(m: re.Match) -> str:
+        hour_words = int_to_words(int(m.group(1)))
+        minute = int(m.group(2))
+        if minute == 0:
+            return slot([hour_words, f"{hour_words} o clock", f"{hour_words} hundred"])
+        if minute < 10:
+            return slot([f"{hour_words} oh {ONES[minute]}", f"{hour_words} {ONES[minute]}", f"{hour_words} zero {ONES[minute]}"])
+        return slot([f"{hour_words} {int_to_words(minute)}"])
+
+    value = re.sub(r"\b(\d{1,2}):(\d{2})\b", _time_sub, value)
+
+    # Fractions and slash dates e.g. 1/2 -> one half, 3/4 -> three quarters, 9/11 -> nine eleven
+    def _fraction_sub(m: re.Match) -> str:
+        num, den = int(m.group(1)), int(m.group(2))
+        num_words, den_words = int_to_words(num), int_to_words(den)
+        variants = []
+        if 0 < num < den <= 10:
+            den_name = {2: "half", 4: "quarter"}.get(den, int_to_ordinal_words(den))
+            if num > 1:
+                den_name = "halves" if den == 2 else den_name + "s"
+            variants += [f"{num_words} {den_name}", f"a {den_name}" if num == 1 else ""]
+            if den == 4:
+                variants.append(f"{num_words} {int_to_ordinal_words(4)}{'s' if num > 1 else ''}")
+            if (num, den) == (1, 2):
+                variants.append("half")
+        variants += [f"{num_words} {den_words}", f"{num_words} over {den_words}"]
+        return slot(_dedupe(variants))
+
+    value = re.sub(r"\b(\d+)/(\d+)\b", _fraction_sub, value)
 
     # Ordinals e.g. 1st, 2nd, 3rd, 21st, 100th
     value = re.sub(r"\b(\d+)(?:st|nd|rd|th)\b", lambda m: int_to_ordinal_words(int(m.group(1))), value)
 
-    # Decimals e.g. 3.5 -> three point five
-    def _dec_sub(m: re.Match) -> str:
-        whole = int_to_words(int(m.group(1)))
-        frac_digits = " ".join(int_to_words(int(d)) for d in m.group(2))
-        return f"{whole} point {frac_digits}"
+    # Decimals e.g. 3.5 -> three point five, three and a half
+    value = re.sub(r"\b(\d+)\.(\d+)\b", lambda m: slot(decimal_spoken_variants(m.group(1), m.group(2))), value)
 
-    value = re.sub(r"\b(\d+)\.(\d+)\b", _dec_sub, value)
-
-    # Cardinal integers e.g. 125 -> one hundred twenty five
-    value = re.sub(r"\b\d+\b", lambda m: int_to_words(int(m.group(0))), value)
+    # Integers e.g. 1999 -> one thousand nine hundred ninety nine, nineteen ninety nine
+    value = re.sub(r"\b\d+\b", lambda m: slot(integer_spoken_variants(m.group(0))), value)
 
     # Common spoken symbols
     value = re.sub(r"&", " and ", value)
@@ -247,10 +454,62 @@ def normalize_validation_text(value: str, filter_fillers: bool = True) -> str:
 
     # Clean remaining punctuation except letters, numbers, and whitespace
     value = re.sub(r"[^a-z0-9 ]+", " ", value)
-    words = value.split()
+    tokens = value.split()
     if filter_fillers:
-        words = [w for w in words if w not in FILLER_WORDS]
-    return " ".join(words)
+        tokens = [w for w in tokens if w not in FILLER_WORDS]
+    return tokens, slots
+
+
+def _expand_tokens(
+    tokens: list[str], slots: list[list[str]], choices: list[int]
+) -> tuple[list[str], list[tuple[int, int]]]:
+    """Expand slot tokens into words; also return each number's (start, end) word span."""
+    words: list[str] = []
+    number_spans: list[tuple[int, int]] = []
+    for token in tokens:
+        index = _slot_index(token)
+        if index is None:
+            words.extend(token.split())
+            continue
+        start = len(words)
+        words.extend(slots[index][choices[index]].split())
+        number_spans.append((start, len(words)))
+    return words, number_spans
+
+
+def normalize_validation_text(value: str, filter_fillers: bool = True) -> str:
+    """Spotless text normalization for Whisper ASR comparison.
+
+    Expands numbers to words, ordinals, currency, percentages, contractions,
+    and removes Chatterbox event tags ([sigh], [laugh]) and common filler words (um, uh).
+    Numbers take their canonical spoken form; see resolve_expected_words for variants.
+    """
+    tokens, slots = _normalize_tokens(value, filter_fillers)
+    return " ".join(_expand_tokens(tokens, slots, [0] * len(slots))[0])
+
+
+def resolve_number_words(text: str, reference_words: list[str]) -> tuple[list[str], list[tuple[int, int]]]:
+    """Normalize text, reading each of its numbers the way the other side of the comparison has it.
+
+    A number like 1999 has several correct readings ("one thousand nine hundred ninety nine",
+    "nineteen ninety nine"); each is tried in turn and the best-aligned one is kept. This runs
+    on the script (digits in the script) and on the transcript (Whisper writing "1999" for a
+    script that spells out "nineteen ninety-nine").
+    """
+    tokens, slots = _normalize_tokens(text, filter_fillers=True)
+    choices = [0] * len(slots)
+    if reference_words:
+        for index, variants in enumerate(slots):
+            if len(variants) < 2:
+                continue
+            best_score = -1.0
+            for variant_index in range(len(variants)):
+                choices[index] = variant_index
+                score = align_words(reference_words, _expand_tokens(tokens, slots, choices)[0])["score"]
+                if score > best_score:
+                    best_score, best_variant = score, variant_index
+            choices[index] = best_variant
+    return _expand_tokens(tokens, slots, choices)
 
 
 def detect_repetition(words: list[str]) -> str | None:
@@ -288,7 +547,7 @@ def analyze_alignment(expected_words: list[str], transcript_words: list[str]) ->
     if not expected_words or not transcript_words:
         return None
 
-    matcher = SequenceMatcher(None, expected_words, transcript_words)
+    matcher = SequenceMatcher(None, expected_words, transcript_words, autojunk=False)
     blocks = matcher.get_matching_blocks()
     real_blocks = [b for b in blocks if b.size > 0]
     if not real_blocks:
@@ -321,6 +580,7 @@ def classify_validation_failure(
     extra: list[str],
     score: float,
     passed: bool,
+    number_errors: list[str] | None = None,
 ) -> tuple[str, str]:
     """Diagnose the root cause of a validation failure for clear UI feedback."""
     if passed:
@@ -332,6 +592,10 @@ def classify_validation_failure(
     repetition = detect_repetition(transcript_words)
     if repetition:
         return "repetition_loop", f"Repetition loop detected: {repetition}"
+
+    if number_errors:
+        listed = "; ".join(number_errors[:5])
+        return "number_mismatch", f"Number not spoken as written: {listed}"
 
     alignment = analyze_alignment(expected_words, transcript_words)
     if alignment:
@@ -346,30 +610,127 @@ def classify_validation_failure(
     return "mismatch", f"Low match score ({score:.2f}). Missing: {missing_sample}; Extra: {extra_sample}"
 
 
-def validation_comparison(expected: str, transcript: str, threshold: float = 0.8) -> dict[str, Any]:
-    expected_normalized = normalize_validation_text(expected, filter_fillers=True)
-    transcript_normalized = normalize_validation_text(transcript, filter_fillers=True)
-    expected_words = expected_normalized.split()
-    transcript_words = transcript_normalized.split()
+def words_similar(a: str, b: str) -> bool:
+    """True when two differing words are likely the same spoken word spelled differently."""
+    if min(len(a), len(b)) < 3:
+        return False
+    return SequenceMatcher(None, a, b, autojunk=False).ratio() >= FUZZY_WORD_THRESHOLD
 
+
+def align_words(expected_words: list[str], transcript_words: list[str]) -> dict[str, Any]:
+    """Align expected and transcribed words, crediting spelling variants and compound splits.
+
+    autojunk is disabled: with it on, any sequence of 200+ items has its frequent
+    elements discarded as junk, which collapses the score of long chunks toward zero.
+    """
+    matcher = SequenceMatcher(None, expected_words, transcript_words, autojunk=False)
+    matched_expected = 0
+    matched_transcript = 0
+    missing: list[str] = []
+    missing_indices: list[int] = []
+    extra: list[str] = []
+    extra_indices: list[int] = []
+    near_matches: list[tuple[str, str]] = []
+
+    for tag, a0, a1, b0, b1 in matcher.get_opcodes():
+        a_block = expected_words[a0:a1]
+        b_block = transcript_words[b0:b1]
+        if tag == "equal":
+            matched_expected += len(a_block)
+            matched_transcript += len(b_block)
+            continue
+        if tag == "replace":
+            # Compound splits e.g. "every day" vs "everyday", "ice cream" vs "icecream"
+            if "".join(a_block) == "".join(b_block):
+                matched_expected += len(a_block)
+                matched_transcript += len(b_block)
+                near_matches.append((" ".join(a_block), " ".join(b_block)))
+                continue
+            # Greedy in-order pairing of spelling variants within the replaced span
+            used: set[int] = set()
+            for offset, word in enumerate(a_block):
+                partner = next(
+                    (j for j, cand in enumerate(b_block) if j not in used and words_similar(word, cand)),
+                    None,
+                )
+                if partner is None:
+                    missing.append(word)
+                    missing_indices.append(a0 + offset)
+                else:
+                    used.add(partner)
+                    matched_expected += 1
+                    matched_transcript += 1
+                    near_matches.append((word, b_block[partner]))
+            for j, cand in enumerate(b_block):
+                if j not in used:
+                    extra.append(cand)
+                    extra_indices.append(b0 + j)
+            continue
+        missing.extend(a_block)
+        missing_indices.extend(range(a0, a1))
+        extra.extend(b_block)
+        extra_indices.extend(range(b0, b1))
+
+    total = len(expected_words) + len(transcript_words)
+    score = (matched_expected + matched_transcript) / total if total else 0.0
+    return {
+        "score": score,
+        "missing": missing,
+        "missing_indices": missing_indices,
+        "extra": extra,
+        "extra_indices": extra_indices,
+        "near_matches": near_matches,
+    }
+
+
+def _number_runs(words: list[str], indices: list[int], spans: list[tuple[int, int]]) -> list[str]:
+    """Group unmatched word positions that belong to a number (digit-derived span or number word)."""
+    in_span = {i for start, end in spans for i in range(start, end)}
+    flagged = sorted(i for i in indices if i in in_span or words[i] in NUMBER_WORDS)
+    runs: list[list[int]] = []
+    for i in flagged:
+        if runs and i == runs[-1][-1] + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    return [" ".join(words[i] for i in run) for run in runs]
+
+
+def validation_comparison(expected: str, transcript: str, threshold: float = 0.8) -> dict[str, Any]:
+    # Numbers can be written either way on either side (script "nineteen ninety-nine", Whisper
+    # "1999", or the reverse), so each side's numbers are read the way the other side has them
+    expected_words, expected_spans = resolve_number_words(
+        expected, normalize_validation_text(transcript, filter_fillers=True).split()
+    )
+    transcript_words, transcript_spans = resolve_number_words(transcript, expected_words)
+    expected_normalized = " ".join(expected_words)
+    transcript_normalized = " ".join(transcript_words)
+
+    alignment = align_words(expected_words, transcript_words)
     if not transcript_normalized or not expected_normalized:
         word_score = 0.0
         char_score = 0.0
     else:
-        word_score = SequenceMatcher(None, expected_words, transcript_words).ratio()
-        char_score = SequenceMatcher(None, expected_normalized, transcript_normalized).ratio()
+        word_score = alignment["score"]
+        # Space-insensitive character similarity catches multi-word phonetic variants
+        # e.g. "kaelen voss" vs "kay lynn vos"
+        char_score = SequenceMatcher(
+            None, expected_normalized.replace(" ", ""), transcript_normalized.replace(" ", ""), autojunk=False
+        ).ratio()
 
     # Optimal composite score: word accuracy with fallback to character similarity for phonetic variants
     score = max(round(word_score, 4), round(char_score, 4))
 
-    expected_counts = Counter(expected_words)
-    transcript_counts = Counter(transcript_words)
-    missing = list((expected_counts - transcript_counts).elements())
-    extra = list((transcript_counts - expected_counts).elements())
-    passed = bool(transcript_normalized) and score >= float(threshold)
+    missing = alignment["missing"]
+    extra = alignment["extra"]
+    # A misread number changes meaning, so it fails the chunk even when the overall score is high
+    number_errors = [
+        f"expected '{run}'" for run in _number_runs(expected_words, alignment["missing_indices"], expected_spans)
+    ] + [f"heard '{run}'" for run in _number_runs(transcript_words, alignment["extra_indices"], transcript_spans)]
+    passed = bool(transcript_normalized) and score >= float(threshold) and not number_errors
 
     diagnostic_category, diagnostic_message = classify_validation_failure(
-        expected_words, transcript_words, missing, extra, score, passed
+        expected_words, transcript_words, missing, extra, score, passed, number_errors
     )
 
     return {
@@ -384,6 +745,8 @@ def validation_comparison(expected: str, transcript: str, threshold: float = 0.8
         "diagnostic_message": diagnostic_message,
         "missing_words": missing[:30],
         "extra_words": extra[:30],
+        "near_matches": [f"{a} ~ {b}" for a, b in alignment["near_matches"][:30]],
+        "number_errors": number_errors,
         "expected_word_count": len(expected_words),
         "transcript_word_count": len(transcript_words),
     }
@@ -392,7 +755,7 @@ def validation_comparison(expected: str, transcript: str, threshold: float = 0.8
 def get_whisper_model(model_name: str, device: str):
     if WhisperModel is None:
         raise gr.Error(
-            "faster-whisper is not installed. In Kaggle, run `pip install faster-whisper` and restart the session."
+            "faster-whisper is not installed. In Kaggle, run `pip install 'faster-whisper>=1.1.0'` and restart the session."
         )
 
     selected_device = str(device or "cpu")
@@ -454,9 +817,13 @@ def transcribe_audio(
         "beam_size": 5,
         "vad_filter": vad_filter,
         "condition_on_previous_text": False,
-        "without_timestamps": True,
+        # Timestamp tokens let Whisper seek to the last complete segment of each 30s window;
+        # without them, chunks longer than 30s lose or duplicate words at window boundaries.
+        "without_timestamps": False,
         "compression_ratio_threshold": 2.6,
-        "no_speech_threshold": 0.4,
+        # Whisper default. Lower values drop quiet/breathy segments as "no speech",
+        # which surfaces as false early_cutoff / missing-word failures.
+        "no_speech_threshold": 0.6,
     }
     if vad_filter:
         kwargs["vad_parameters"] = {
@@ -540,6 +907,7 @@ def validation_details(chunk: dict[str, Any] | None) -> str:
             "no_speech": "⚠️ No Speech",
             "repetition_loop": "⚠️ Repetition Loop",
             "early_cutoff": "⚠️ Early Cutoff",
+            "number_mismatch": "⚠️ Number Mismatch",
             "head_cutoff": "⚠️ Head Cutoff",
             "hallucination": "⚠️ Hallucination",
             "mismatch": "⚠️ Word Mismatch",

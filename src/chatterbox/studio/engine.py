@@ -695,6 +695,10 @@ def regenerate_failed_chunks(
         chunk["validation_status"] = None
         try:
             resolved_settings = chunk_settings_for(session, chunk, ui_settings)
+            # A fixed seed would reproduce the exact take that failed; shift it per retry
+            chunk["regen_attempts"] = int(chunk.get("regen_attempts") or 0) + 1
+            if int(resolved_settings.get("seed_num") or 0):
+                resolved_settings["seed_num"] = int(resolved_settings["seed_num"]) + 100_000 * chunk["regen_attempts"]
             wav, sr, device = generate_chunk_wav(
                 adapter, chunk["text"], chunk["index"], reference_audio_path, resolved_settings
             )

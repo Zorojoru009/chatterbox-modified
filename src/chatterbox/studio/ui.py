@@ -55,6 +55,9 @@ from .session import (
     status_message,
 )
 from .validator import (
+    DEFAULT_WHISPER_MODEL_CPU,
+    DEFAULT_WHISPER_MODEL_GPU,
+    WHISPER_MODEL_CHOICES,
     build_full_report_markdown,
     build_validation_overview,
     check_audio_all,
@@ -549,9 +552,10 @@ def build_studio_app(default_reference_audio: str = DEFAULT_REFERENCE_AUDIO) -> 
                             info="Validates text accuracy and flags hallucinated or missed words.",
                         )
                         whisper_model_name = gr.Dropdown(
-                            ["tiny.en", "base.en", "small.en", "medium.en"],
-                            value="small.en",
+                            WHISPER_MODEL_CHOICES,
+                            value=DEFAULT_WHISPER_MODEL_GPU if torch.cuda.is_available() else DEFAULT_WHISPER_MODEL_CPU,
                             label="Whisper model",
+                            info="large-v3-turbo: near large-v3 accuracy at ~small speed on GPU (~1.6 GB VRAM fp16).",
                         )
                         whisper_device = gr.Dropdown(
                             ["cpu", "cuda:0", "cuda:1"],

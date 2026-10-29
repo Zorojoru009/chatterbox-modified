@@ -519,9 +519,94 @@ class StudioUnitTests(unittest.TestCase):
                 self.assertTrue(mock_model.transcribe.called)
                 _args, kwargs = mock_model.transcribe.call_args
                 self.assertFalse(kwargs["vad_filter"])
-                self.assertTrue(kwargs["without_timestamps"])
+                self.assertFalse(kwargs["without_timestamps"])
                 self.assertEqual(kwargs["compression_ratio_threshold"], 2.6)
-                self.assertEqual(kwargs["no_speech_threshold"], 0.4)
+                self.assertEqual(kwargs["no_speech_threshold"], 0.6)
+
+    def test_validation_long_chunk_not_collapsed_by_autojunk(self):
+        # 200+ word chunks used to score ~0.01 because SequenceMatcher autojunk discarded common words
+        sentence = "the farmer watched the river from the porch of the old house while the sun went down"
+        expected = " ".join([sentence] * 15)
+        transcript = expected.replace("farmer", "farmers", 1)
+        res = validation_comparison(expected, transcript, threshold=0.9)
+        self.assertGreater(res["word_score"], 0.99)
+        self.assertGreater(res["char_score"], 0.99)
+        self.assertTrue(res["passed"])
+
+    def test_validation_spelling_variants_and_compounds(self):
+        expected = "Doctor Kaelen walked through the colour garden every day in the U.S."
+        transcript = "Dr. Kaylen walked through the color garden everyday in the US. (laughs)"
+        res = validation_comparison(expected, transcript, threshold=0.95)
+        self.assertTrue(res["passed"], res)
+        self.assertEqual(res["missing_words"], [])
+        self.assertEqual(res["extra_words"], [])
+        self.assertIn("kaelen ~ kaylen", res["near_matches"])
+
+    def test_validation_accepts_alternate_number_readings(self):
+        cases = [
+            ("In 1999 it began.", "In nineteen ninety-nine it began."),
+            ("By 2024 it ended.", "By twenty twenty-four it ended."),
+            ("It cost 2,500 dollars.", "It cost twenty-five hundred dollars."),
+            ("About 3.5 million people.", "About three and a half million people."),
+            ("In the 1990s things changed.", "In the nineteen nineties things changed."),
+            ("It was $1.5 million.", "It was one point five million dollars."),
+            ("It cost $4.99 today.", "It cost four ninety-nine today."),
+            ("Around 100 people came.", "Around a hundred people came."),
+            ("At 10:05 we left.", "At ten oh five we left."),
+            ("It weighed 5kg.", "It weighed five kilograms."),
+            ("World War II ended.", "World War Two ended."),
+            ("Henry VIII ruled.", "Henry the Eighth ruled."),
+            ("Room 1204 is open.", "Room twelve oh four is open."),
+            ("He sold 350 units.", "He sold three hundred and fifty units."),
+        ]
+        for expected, transcript in cases:
+            res = validation_comparison(expected, transcript, threshold=0.95)
+            self.assertTrue(res["passed"], (expected, transcript, res["expected_normalized"]))
+            # Whisper writing digits must still match too
+            self.assertTrue(validation_comparison(expected, expected, threshold=0.95)["passed"], expected)
+
+    def test_validation_wrong_number_fails_despite_high_score(self):
+        prefix = (
+            "The committee met in the spring to review the findings and the long term plan for the region, "
+            "and after many hours of careful debate they agreed on a path forward "
+        )
+        res = validation_comparison(prefix + "starting in 1999.", prefix + "starting in nineteen eighty-nine.", threshold=0.9)
+        self.assertGreater(res["score"], 0.95)
+        self.assertFalse(res["passed"])
+        self.assertEqual(res["diagnostic_category"], "number_mismatch")
+        self.assertEqual(res["number_errors"], ["expected 'ninety'", "heard 'eighty'"])
+
+    def test_validation_spelled_out_script_matches_digit_transcript(self):
+        # Scripts spell numbers out; Whisper usually writes digits
+        cases = [
+            ("In nineteen ninety-nine it began.", "In 1999 it began."),
+            ("By twenty twenty-four it ended.", "By 2024 it ended."),
+            ("It cost twenty-five hundred dollars.", "It cost $2,500."),
+            ("About three and a half million people.", "About 3.5 million people."),
+            ("Room twelve oh four is open.", "Room 1204 is open."),
+            ("He sold three hundred and fifty units.", "He sold 350 units."),
+        ]
+        for expected, transcript in cases:
+            res = validation_comparison(expected, transcript, threshold=0.95)
+            self.assertTrue(res["passed"], (expected, transcript, res["transcript_normalized"]))
+
+    def test_validation_wrong_number_fails_in_spelled_out_script(self):
+        prefix = (
+            "The committee met in the spring to review the findings and the long term plan for the region, "
+            "and after many hours of careful debate they agreed on a path forward "
+        )
+        expected = prefix + "starting in nineteen ninety-nine."
+        for transcript in (prefix + "starting in 1989.", prefix + "starting in nineteen eighty-nine."):
+            res = validation_comparison(expected, transcript, threshold=0.9)
+            self.assertFalse(res["passed"], transcript)
+            self.assertEqual(res["diagnostic_category"], "number_mismatch")
+
+    def test_validation_still_catches_dropped_words(self):
+        expected = "She opened the heavy wooden door and stepped out into the cold night air"
+        transcript = "She opened the door and stepped into the night"
+        res = validation_comparison(expected, transcript, threshold=0.9)
+        self.assertFalse(res["passed"])
+        self.assertEqual(sorted(res["missing_words"]), ["air", "cold", "heavy", "out", "wooden"])
 
     def test_trim_silence_boundary(self):
         try:

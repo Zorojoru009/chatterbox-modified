@@ -241,6 +241,12 @@ def _narrator_worker(
                 take.update(passed=False, score=0.0, category="validator_error", message=str(exc))
             if take["passed"]:
                 break
+            # The same transcript twice means the text or the validator is the problem, not the take: another
+            # seed cannot fix it, so stop and let the report flag it (b034/b042, 2026-10-30: 4 identical takes)
+            if len(takes) > 1 and take.get("transcript") and take.get("transcript") == takes[-2].get("transcript"):
+                take["message"] = f"{take['message']} (same transcript as the previous take; retries stopped)"
+                print(f"[{device_str}] Whisper: chunk {chunk_id} gave the same transcript twice; not retrying", file=sys.stderr)
+                break
             print(
                 f"[{device_str}] Whisper: chunk {chunk_id} take {round_no + 1}/{rounds} scored "
                 f"{take['score']:.3f} ({take['category']}: {take['message']})",

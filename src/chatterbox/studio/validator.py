@@ -375,7 +375,9 @@ def _normalize_tokens(value: str, filter_fillers: bool) -> tuple[list[str], list
         whole, frac, scale = m.group(2), m.group(3), m.group(4)
         if scale:
             scale = SCALE_ALIASES.get(scale, scale)
-            return slot([f"{amount} {scale} {units}" for amount in _number_spoken_variants(whole, frac)])
+            variants = [f"{amount} {scale} {units}" for amount in _number_spoken_variants(whole, frac)]
+            variants += [f"{amount} {scale}" for amount in _number_spoken_variants(whole, frac)]
+            return slot(_dedupe(variants))
         main = unit if int(whole) == 1 else units
         variants = [f"{amount} {main}" for amount in integer_spoken_variants(whole)]
         if frac and len(frac) <= 2 and int(frac) > 0:
@@ -389,6 +391,12 @@ def _normalize_tokens(value: str, filter_fillers: bool) -> tuple[list[str], list
                 f"{whole_words} {main} {cents_words}",
                 f"{whole_words} {cents_words}",
             ] + [f"{amount} {units}" for amount in decimal_spoken_variants(whole, frac)]
+        # Whisper writes "$" where the speaker never says the unit: "one hundred is rent" -> "$100 is rent",
+        # "three to five hundred dollars" -> "$3 to $500"; the bare amount is a correct reading too
+        if scale:
+            variants += [f"{amount} {scale}" for amount in _number_spoken_variants(whole, frac)]
+        else:
+            variants += _number_spoken_variants(whole, frac)
         return slot(_dedupe(variants))
 
     value = re.sub(

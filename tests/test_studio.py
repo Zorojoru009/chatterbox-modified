@@ -585,6 +585,10 @@ class StudioUnitTests(unittest.TestCase):
             ("About three and a half million people.", "About 3.5 million people."),
             ("Room twelve oh four is open.", "Room 1204 is open."),
             ("He sold three hundred and fifty units.", "He sold 350 units."),
+            # clock times: Whisper drops the colon or writes a dot (Profit Trail b003, 2026-10-30)
+            ("On a Friday at four forty-seven, it ended.", "On a Friday at 447, it ended."),
+            ("On a Friday at four forty-seven, it ended.", "On a Friday at 4.47, it ended."),
+            ("The train left at nine oh five.", "The train left at 905."),
         ]
         for expected, transcript in cases:
             res = validation_comparison(expected, transcript, threshold=0.95)

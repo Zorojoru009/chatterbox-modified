@@ -299,6 +299,25 @@ def _synthesize(model, model_name: str, text: str, settings: dict[str, Any], app
         )
 
 
+def _next_result(result_queue: mp.Queue, workers: list[mp.Process], devices: list[str], poll_s: float = 30.0):
+    """result_queue.get() that cannot hang: a worker killed outright (CUDA abort, OOM kill, segfault) never
+    reports back, so check every poll_s that every worker is still alive and fail loudly if one died."""
+    import queue as _queue
+
+    while True:
+        try:
+            return result_queue.get(timeout=poll_s)
+        except _queue.Empty:
+            dead = [f"{dev} (exit code {w.exitcode})" for w, dev in zip(workers, devices) if not w.is_alive()]
+            if dead:
+                for w in workers:
+                    if w.is_alive():
+                        w.terminate()
+                raise RuntimeError(
+                    f"STOP: worker on {', '.join(dead)} died without reporting; see its last lines above"
+                )
+
+
 def detect_devices(device_arg: str | None) -> list[str]:
     """Resolves target compute devices from argument or hardware detection."""
     if device_arg and device_arg.strip().lower() != "auto":
@@ -514,7 +533,7 @@ def run_batch_narrator(
     # Wait for all workers to report ready
     ready_workers = 0
     while ready_workers < len(devices):
-        msg = result_queue.get()
+        msg = _next_result(result_queue, workers, devices)
         event_type = msg[0]
         if event_type == "WORKER_READY":
             ready_workers += 1
@@ -538,7 +557,7 @@ def run_batch_narrator(
     total_spoken_seconds = 0.0
 
     while completed_chunks + len(failed_chunks) < num_jobs:
-        msg = result_queue.get()
+        msg = _next_result(result_queue, workers, devices)
         event_type, chunk_idx, chunk_id, duration_s, err, dev, result = msg
 
         if event_type == "CHUNK_DONE":

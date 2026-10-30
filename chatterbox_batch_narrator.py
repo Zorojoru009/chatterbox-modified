@@ -166,116 +166,65 @@ def _narrator_worker(
     # Notify main process that worker is fully warm and ready
     result_queue.put(("WORKER_READY", None, None, 0.0, None, device_str, None))
 
-    # Processing loop
+    # Processing loop: the main process runs the phases (generate all, check all, regenerate the failures),
+    # so a worker only ever does one of two things
     while True:
         task = task_queue.get()
         if task is None:  # Poison pill
             break
 
-        chunk_idx, chunk_id, text, settings, out_chunk_path = task
-        out_chunk_path = Path(out_chunk_path)
-
-        # Every synthesis gets the next seed (seed_base, +101, +202, ...), so the first take matches a
-        # run without validation and a retry never repeats a take that failed.
-        seed_base = int(settings.get("seed_num") or 0) + int(chunk_idx)
-        seed_count = 0
-        last_error = ""
-        takes: list[dict[str, Any]] = []
-        rounds = 1 + (int(validate["regen_rounds"]) if validate else 0)
-
-        for round_no in range(rounds):
-            # Synthesis with automatic health-guard retry
-            wav = None
-            for attempt in range(1, 4):
-                current_seed = seed_base + seed_count * 101
-                seed_count += 1
-                set_seed(current_seed)
-                try:
-                    candidate = _synthesize(model, model_name, text, settings, apply_watermark)
-                except Exception as exc:
-                    last_error = str(exc)
-                    print(
-                        f"[{device_str}] Generation error on chunk {chunk_id} (attempt {attempt}): {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
-                is_healthy, max_amp, std_amp = check_signal_health(candidate)
-                if is_healthy:
-                    wav = candidate
-                    break
-                print(
-                    f"[{device_str}] Health Guard: Chunk {chunk_id} attempt {attempt} unhealthy "
-                    f"(max_amp={max_amp:.3f}, std={std_amp:.3f}). Retrying...",
-                    file=sys.stderr,
-                )
-            if wav is None:
-                break
-
-            take_path = out_chunk_path.with_name(f"{out_chunk_path.stem}.take{round_no}.wav")
-            ta.save(str(take_path), wav.cpu(), model.sr)
-            take: dict[str, Any] = {
-                "seed": current_seed,
-                "path": take_path,
-                "duration_s": round(wav.shape[-1] / float(model.sr), 3),
-                "passed": True,
-                "score": None,
-            }
-            takes.append(take)
-            if not validate:
-                break
-
+        if task[0] == "VAL":
+            _, chunk_idx, chunk_id, text, take_path = task
             try:
                 transcript = transcribe_audio(str(take_path), validate["whisper_model"], device_str)
                 cmp = validation_comparison(text, transcript, float(validate["threshold"]))
-                take.update(
-                    passed=cmp["passed"],
-                    score=cmp["score"],
-                    category=cmp["diagnostic_category"],
-                    message=cmp["diagnostic_message"],
-                    transcript=transcript,
-                    missing_words=cmp["missing_words"][:10],
-                    extra_words=cmp["extra_words"][:10],
-                    number_errors=cmp["number_errors"],
-                )
+                check = {
+                    "passed": cmp["passed"],
+                    "score": cmp["score"],
+                    "category": cmp["diagnostic_category"],
+                    "message": cmp["diagnostic_message"],
+                    "transcript": transcript,
+                    "missing_words": cmp["missing_words"][:10],
+                    "extra_words": cmp["extra_words"][:10],
+                    "number_errors": cmp["number_errors"],
+                }
             except Exception as exc:
-                take.update(passed=False, score=0.0, category="validator_error", message=str(exc))
-            if take["passed"]:
-                break
-            # The same transcript twice means the text or the validator is the problem, not the take: another
-            # seed cannot fix it, so stop and let the report flag it (b034/b042, 2026-10-30: 4 identical takes)
-            if len(takes) > 1 and take.get("transcript") and take.get("transcript") == takes[-2].get("transcript"):
-                take["message"] = f"{take['message']} (same transcript as the previous take; retries stopped)"
-                print(f"[{device_str}] Whisper: chunk {chunk_id} gave the same transcript twice; not retrying", file=sys.stderr)
-                break
-            print(
-                f"[{device_str}] Whisper: chunk {chunk_id} take {round_no + 1}/{rounds} scored "
-                f"{take['score']:.3f} ({take['category']}: {take['message']})",
-                file=sys.stderr,
-            )
-
-        if not takes:
-            err_msg = last_error or "Signal health guard failed after max retries."
-            result_queue.put(("CHUNK_FAILED", chunk_idx, chunk_id, 0.0, err_msg, device_str, None))
+                check = {"passed": False, "score": 0.0, "category": "validator_error", "message": str(exc)}
+            result_queue.put(("VAL_DONE", chunk_idx, chunk_id, 0.0, None, device_str, check))
             continue
 
-        # Keep a passing take, else the best-scoring one; the report shows every take
-        best = max(takes, key=lambda t: (bool(t["passed"]), t["score"] or 0.0))
-        for t in takes:
-            if t is best:
-                Path(t["path"]).replace(out_chunk_path)
-            else:
-                Path(t["path"]).unlink(missing_ok=True)
-        attempts = [{k: v for k, v in t.items() if k != "path"} for t in takes]
-        result = {
-            "passed": best["passed"],
-            "score": best["score"],
-            "seed": best["seed"],
-            "category": best.get("category"),
-            "message": best.get("message"),
-            "transcript": best.get("transcript"),
-            "attempts": attempts,
-        }
-        result_queue.put(("CHUNK_DONE", chunk_idx, chunk_id, best["duration_s"], None, device_str, result))
+        _, chunk_idx, chunk_id, text, settings, take_path, round_no = task
+        # Seeds: seed_base for the first take (as without validation), then +101 per synthesis, so a
+        # regeneration never repeats a take that failed. Up to 3 health-guard attempts per round.
+        seed_base = int(settings.get("seed_num") or 0) + int(chunk_idx)
+        last_error = ""
+        wav = None
+        for attempt in range(3):
+            current_seed = seed_base + (round_no * 3 + attempt) * 101
+            set_seed(current_seed)
+            try:
+                candidate = _synthesize(model, model_name, text, settings, apply_watermark)
+            except Exception as exc:
+                last_error = str(exc)
+                print(f"[{device_str}] Generation error on chunk {chunk_id} (attempt {attempt + 1}): {exc}", file=sys.stderr)
+                continue
+            is_healthy, max_amp, std_amp = check_signal_health(candidate)
+            if is_healthy:
+                wav = candidate
+                break
+            print(
+                f"[{device_str}] Health Guard: Chunk {chunk_id} attempt {attempt + 1} unhealthy "
+                f"(max_amp={max_amp:.3f}, std={std_amp:.3f}). Retrying...",
+                file=sys.stderr,
+            )
+        if wav is None:
+            err_msg = last_error or "Signal health guard failed after max retries."
+            result_queue.put(("GEN_FAILED", chunk_idx, chunk_id, 0.0, err_msg, device_str, None))
+            continue
+        ta.save(str(take_path), wav.cpu(), model.sr)
+        duration_s = round(wav.shape[-1] / float(model.sr), 3)
+        take = {"seed": current_seed, "path": str(take_path), "duration_s": duration_s}
+        result_queue.put(("GEN_DONE", chunk_idx, chunk_id, duration_s, None, device_str, take))
 
 
 def _synthesize(model, model_name: str, text: str, settings: dict[str, Any], apply_watermark: bool) -> torch.Tensor:
@@ -553,41 +502,105 @@ def run_batch_narrator(
     print(f"⚡ All {len(devices)} GPU worker processes online. Dispatching {num_jobs} chunks...")
     t_start = time.perf_counter()
 
-    # Enqueue all tasks
-    for task in tasks:
-        task_queue.put(task)
+    def run_phase(phase_tasks: list[tuple], label: str) -> list[tuple]:
+        """Queue one phase's tasks on both GPUs and wait for all of them."""
+        for t in phase_tasks:
+            task_queue.put(t)
+        results, t0 = [], time.perf_counter()
+        for n in range(1, len(phase_tasks) + 1):
+            msg = _next_result(result_queue, workers, devices)
+            results.append(msg)
+            if n % 10 == 0 or n == len(phase_tasks):
+                elapsed = time.perf_counter() - t0
+                print(f"[{label}] {n}/{len(phase_tasks)} | Elapsed: {elapsed:.1f}s | "
+                      f"ETA: {elapsed / n * (len(phase_tasks) - n):.1f}s")
+        return results
 
-    # Track progress
-    completed_chunks = 0
+    def take_path(index: int, round_no: int) -> Path:
+        out = Path(manifest_by_index[index]["audio_path"])
+        return out.with_name(f"{out.stem}.take{round_no}.wav")
+
+    # Like the Gradio studio: generate every chunk first, then Whisper-check them all, then regenerate only the
+    # failures (and check those), round after round. Here the checks run on both GPUs, not one.
+    takes: dict[int, list[dict[str, Any]]] = {t[0]: [] for t in tasks}
+    gen_errors: dict[int, str] = {}
+    task_by_index = {t[0]: t for t in tasks}
+    pending = [t[0] for t in tasks]
+    rounds = 1 + (int(validate["regen_rounds"]) if validate else 0)
+
+    for round_no in range(rounds):
+        label = "Generate" if round_no == 0 else f"Regenerate {round_no}/{rounds - 1}"
+        print(f"\n🎙️  {label}: {len(pending)} chunk(s)")
+        gen = run_phase(
+            [("GEN", i, task_by_index[i][1], task_by_index[i][2], task_by_index[i][3], take_path(i, round_no), round_no)
+             for i in pending],
+            label,
+        )
+        made = []
+        for event_type, chunk_idx, chunk_id, _, err, dev, take in gen:
+            if event_type == "GEN_DONE":
+                take["passed"], take["score"] = (False, None) if validate else (True, None)
+                takes[chunk_idx].append(take)
+                made.append(chunk_idx)
+            else:
+                print(f"[{dev}] ❌ Chunk {chunk_id} FAILED: {err}", file=sys.stderr)
+                gen_errors[chunk_idx] = err
+        if not validate:
+            break
+
+        print(f"\n🔍 Whisper check: {len(made)} chunk(s)")
+        checks = run_phase(
+            [("VAL", i, task_by_index[i][1], task_by_index[i][2], takes[i][-1]["path"]) for i in made],
+            f"Whisper {round_no + 1}",
+        )
+        for _, chunk_idx, chunk_id, _, _, dev, check in checks:
+            takes[chunk_idx][-1].update(check)
+            if not check["passed"]:
+                print(f"[{dev}] Whisper: chunk {chunk_id} take {len(takes[chunk_idx])} scored {check['score']:.3f} "
+                      f"({check['category']}: {check['message']})", file=sys.stderr)
+
+        next_pending = []
+        for i in pending:
+            history = takes[i]
+            if history and history[-1]["passed"]:
+                continue
+            # The same transcript twice means the text or the validator is the problem, not the take: another
+            # seed cannot fix it (b034/b042, 2026-10-30: 4 identical takes), so stop and let the report flag it
+            if len(history) > 1 and history[-1].get("transcript") and history[-1].get("transcript") == history[-2].get("transcript"):
+                history[-1]["message"] = f"{history[-1]['message']} (same transcript as the previous take; retries stopped)"
+                print(f"Whisper: chunk {task_by_index[i][1]} gave the same transcript twice; not retrying", file=sys.stderr)
+                continue
+            next_pending.append(i)
+        passed_now = sum(1 for i in takes if takes[i] and takes[i][-1]["passed"])
+        print(f"✔️  {passed_now}/{len(takes)} chunk(s) pass after round {round_no + 1}")
+        pending = next_pending
+        if not pending:
+            break
+
+    # Keep a passing take, else the best-scoring one; the report shows every take
     failed_chunks = []
     total_spoken_seconds = 0.0
-
-    while completed_chunks + len(failed_chunks) < num_jobs:
-        msg = _next_result(result_queue, workers, devices)
-        event_type, chunk_idx, chunk_id, duration_s, err, dev, result = msg
-
-        if event_type == "CHUNK_DONE":
-            completed_chunks += 1
-            total_spoken_seconds += duration_s
-            elapsed = time.perf_counter() - t_start
-            pace = elapsed / completed_chunks
-            remaining_sec = pace * (num_jobs - completed_chunks)
-            record_chunk(report, manifest_by_index[chunk_idx], result)
-
-            check = ""
-            if validate:
-                takes = len(result["attempts"])
-                mark = "pass" if result["passed"] else "FAIL"
-                check = f" | Whisper {result['score']:.3f} {mark}" + (f" after {takes} takes" if takes > 1 else "")
-            print(
-                f"[{dev}] {'✅' if result['passed'] else '⚠️ '} Chunk {chunk_id} ({completed_chunks}/{num_jobs}) | "
-                f"Spoken: {duration_s:.1f}s{check} | Elapsed: {elapsed:.1f}s | "
-                f"ETA: {remaining_sec:.1f}s"
-            )
-
-        elif event_type == "CHUNK_FAILED":
-            print(f"[{dev}] ❌ Chunk {chunk_id} FAILED: {err}", file=sys.stderr)
-            failed_chunks.append((chunk_idx, chunk_id, err))
+    for i, history in takes.items():
+        item = manifest_by_index[i]
+        if not history:
+            failed_chunks.append((i, item["id"], gen_errors.get(i, "no take generated")))
+            continue
+        best = max(history, key=lambda t: (bool(t["passed"]), t["score"] or 0.0))
+        for t in history:
+            if t is best:
+                Path(t["path"]).replace(item["audio_path"])
+            else:
+                Path(t["path"]).unlink(missing_ok=True)
+        total_spoken_seconds += best["duration_s"]
+        record_chunk(report, item, {
+            "passed": best["passed"],
+            "score": best["score"],
+            "seed": best["seed"],
+            "category": best.get("category"),
+            "message": best.get("message"),
+            "transcript": best.get("transcript"),
+            "attempts": [{k: v for k, v in t.items() if k != "path"} for t in history],
+        })
 
     # Send poison pill to workers
     for _ in devices:

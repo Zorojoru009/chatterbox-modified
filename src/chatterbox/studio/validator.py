@@ -280,6 +280,9 @@ def integer_spoken_variants(digits: str) -> list[str]:
     ]
     if len(digits) == 4 and n >= 1000:
         variants.append(paired_digit_words(n))
+    # Whisper writes a spoken clock time without its colon: "four forty-seven" -> 447, "nine oh five" -> 905
+    if len(digits) == 3 and digits[0] != "0" and 0 < n % 100 < 60:
+        variants.append(paired_digit_words(n))
     if digits.startswith("0") and len(digits) > 1 or len(digits) >= 5:
         variants.append(_digit_words(digits, "oh"))
         variants.append(_digit_words(digits, "zero"))
@@ -293,6 +296,9 @@ def decimal_spoken_variants(whole: str, frac: str) -> list[str]:
     variants = [f"{whole_words} point {frac_words}", f"{whole_words} point {_digit_words(frac, 'oh')}"]
     if int(whole) == 0:
         variants.append(f"point {frac_words}")
+    # ...or with a dot: "four forty-seven" -> 4.47
+    if len(frac) == 2 and 1 <= int(whole) <= 12 and int(frac) < 60:
+        variants.append(paired_digit_words(int(whole) * 100 + int(frac)))
     fraction_names = {"5": "a half", "25": "a quarter", "75": "three quarters"}
     if frac in fraction_names:
         variants.append(f"{whole_words} and {fraction_names[frac]}")

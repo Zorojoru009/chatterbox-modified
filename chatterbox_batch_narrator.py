@@ -16,6 +16,11 @@ Key Architectural Features:
    repetition_penalty, exaggeration, cfg_weight), and pause_after_ms.
 4. Signal Health Guard: Automatic detection of digital silence, amplitude collapse,
    or clipping with automated seed re-rolling.
+4b. Whisper Validation (--validate): each chunk is transcribed on its own GPU with the
+   studio validator (same scoring as the Gradio app) and regenerated with a new seed
+   until it passes or --regen-rounds runs out; the best take is kept and every take is
+   logged in validation_report.json. --only-chunks reruns just some chunks (or "failed")
+   and re-merges with the earlier chunk wavs.
 5. Smart Boundary Trimming: Trims digital dead-air and applies smooth 5ms fades
    before inserting exact pause_after_ms silence intervals.
 6. Clean 24kHz 16-bit PCM Export: Direct master WAV export ready for WhisperX
@@ -44,6 +49,7 @@ import torch
 import torch.multiprocessing as mp
 import torchaudio as ta
 
+from batch_report import load_report, plan_chunks, record_chunk, save_report, summarize
 from chatterbox.studio.config import (
     MODEL_CHOICES,
     MODEL_NANO,
@@ -103,8 +109,13 @@ def _narrator_worker(
     ref_audio_path: str,
     ckpt_dir: str | None,
     apply_watermark: bool,
+    validate: dict[str, Any] | None = None,
 ) -> None:
-    """Dedicated worker process bound to a single GPU device."""
+    """Dedicated worker process bound to a single GPU device.
+
+    validate: None, or {"whisper_model", "threshold", "regen_rounds"} to Whisper-check every chunk
+    on this worker's GPU and regenerate the chunks that fail.
+    """
     configure_worker_gpu(device_str)
 
     try:
@@ -140,13 +151,20 @@ def _narrator_worker(
         else:
             print(f"[{device_str}] Warning: No reference audio provided; using model defaults.")
 
+        if validate:
+            from chatterbox.studio.validator import get_whisper_model, transcribe_audio, validation_comparison
+
+            t0_whisper = time.perf_counter()
+            get_whisper_model(validate["whisper_model"], device_str)  # load now, so a bad install fails early
+            print(f"[{device_str}] Whisper {validate['whisper_model']} loaded in {time.perf_counter() - t0_whisper:.2f}s.")
+
     except Exception as exc:
         print(f"[{device_str}] FATAL: Worker initialization failed: {exc}", file=sys.stderr)
-        result_queue.put(("WORKER_INIT_ERROR", None, None, 0.0, str(exc), device_str))
+        result_queue.put(("WORKER_INIT_ERROR", None, None, 0.0, str(exc), device_str, None))
         return
 
     # Notify main process that worker is fully warm and ready
-    result_queue.put(("WORKER_READY", None, None, 0.0, None, device_str))
+    result_queue.put(("WORKER_READY", None, None, 0.0, None, device_str, None))
 
     # Processing loop
     while True:
@@ -155,79 +173,130 @@ def _narrator_worker(
             break
 
         chunk_idx, chunk_id, text, settings, out_chunk_path = task
+        out_chunk_path = Path(out_chunk_path)
 
-        # Perform synthesis with automatic health-guard retry
-        max_attempts = 3
+        # Every synthesis gets the next seed (seed_base, +101, +202, ...), so the first take matches a
+        # run without validation and a retry never repeats a take that failed.
         seed_base = int(settings.get("seed_num") or 0) + int(chunk_idx)
-        success = False
+        seed_count = 0
         last_error = ""
+        takes: list[dict[str, Any]] = []
+        rounds = 1 + (int(validate["regen_rounds"]) if validate else 0)
 
-        t0_gen = time.perf_counter()
-
-        for attempt in range(1, max_attempts + 1):
-            current_seed = seed_base + (attempt - 1) * 101
-            set_seed(current_seed)
-
-            try:
-                with torch.inference_mode():
-                    if model_name == MODEL_ORIGINAL:
-                        wav = model.generate(
-                            text=text,
-                            audio_prompt_path=None,  # Uses cached conditionals
-                            repetition_penalty=float(settings.get("repetition_penalty", 1.2)),
-                            min_p=float(settings.get("min_p", 0.05)),
-                            top_p=float(settings.get("top_p", 1.0)),
-                            exaggeration=float(settings.get("exaggeration", 0.5)),
-                            cfg_weight=float(settings.get("cfg_weight", 0.5)),
-                            temperature=float(settings.get("temperature", 0.8)),
-                            apply_watermark=apply_watermark,
-                        )
-                    else:
-                        wav = model.generate(
-                            text=text,
-                            audio_prompt_path=None,
-                            repetition_penalty=float(settings.get("repetition_penalty", 1.2)),
-                            min_p=float(settings.get("min_p", 0.00)),
-                            top_p=float(settings.get("top_p", 0.95)),
-                            top_k=int(settings.get("top_k") or 1000),
-                            temperature=float(settings.get("temperature", 0.8)),
-                            norm_loudness=bool(settings.get("norm_loudness", True)),
-                            apply_watermark=apply_watermark,
-                        )
-
-                # Signal health check
-                is_healthy, max_amp, std_amp = check_signal_health(wav)
-                if not is_healthy:
+        for round_no in range(rounds):
+            # Synthesis with automatic health-guard retry
+            wav = None
+            for attempt in range(1, 4):
+                current_seed = seed_base + seed_count * 101
+                seed_count += 1
+                set_seed(current_seed)
+                try:
+                    candidate = _synthesize(model, model_name, text, settings, apply_watermark)
+                except Exception as exc:
+                    last_error = str(exc)
                     print(
-                        f"[{device_str}] Health Guard: Chunk {chunk_id} attempt {attempt} unhealthy "
-                        f"(max_amp={max_amp:.3f}, std={std_amp:.3f}). Retrying...",
+                        f"[{device_str}] Generation error on chunk {chunk_id} (attempt {attempt}): {exc}",
                         file=sys.stderr,
                     )
                     continue
-
-                # Save chunk WAV
-                ta.save(str(out_chunk_path), wav.cpu(), model.sr)
-                duration_s = wav.shape[-1] / float(model.sr)
-                gen_wall_sec = time.perf_counter() - t0_gen
-
-                result_queue.put(
-                    ("CHUNK_DONE", chunk_idx, chunk_id, duration_s, None, device_str)
-                )
-                success = True
-                break
-
-            except Exception as exc:
-                last_error = str(exc)
+                is_healthy, max_amp, std_amp = check_signal_health(candidate)
+                if is_healthy:
+                    wav = candidate
+                    break
                 print(
-                    f"[{device_str}] Generation error on chunk {chunk_id} (attempt {attempt}): {exc}",
+                    f"[{device_str}] Health Guard: Chunk {chunk_id} attempt {attempt} unhealthy "
+                    f"(max_amp={max_amp:.3f}, std={std_amp:.3f}). Retrying...",
                     file=sys.stderr,
                 )
+            if wav is None:
+                break
 
-        if not success:
-            err_msg = last_error or "Signal health guard failed after max retries."
-            result_queue.put(
-                ("CHUNK_FAILED", chunk_idx, chunk_id, 0.0, err_msg, device_str)
+            take_path = out_chunk_path.with_name(f"{out_chunk_path.stem}.take{round_no}.wav")
+            ta.save(str(take_path), wav.cpu(), model.sr)
+            take: dict[str, Any] = {
+                "seed": current_seed,
+                "path": take_path,
+                "duration_s": round(wav.shape[-1] / float(model.sr), 3),
+                "passed": True,
+                "score": None,
+            }
+            takes.append(take)
+            if not validate:
+                break
+
+            try:
+                transcript = transcribe_audio(str(take_path), validate["whisper_model"], device_str)
+                cmp = validation_comparison(text, transcript, float(validate["threshold"]))
+                take.update(
+                    passed=cmp["passed"],
+                    score=cmp["score"],
+                    category=cmp["diagnostic_category"],
+                    message=cmp["diagnostic_message"],
+                    transcript=transcript,
+                    missing_words=cmp["missing_words"][:10],
+                    extra_words=cmp["extra_words"][:10],
+                    number_errors=cmp["number_errors"],
+                )
+            except Exception as exc:
+                take.update(passed=False, score=0.0, category="validator_error", message=str(exc))
+            if take["passed"]:
+                break
+            print(
+                f"[{device_str}] Whisper: chunk {chunk_id} take {round_no + 1}/{rounds} scored "
+                f"{take['score']:.3f} ({take['category']}: {take['message']})",
+                file=sys.stderr,
             )
+
+        if not takes:
+            err_msg = last_error or "Signal health guard failed after max retries."
+            result_queue.put(("CHUNK_FAILED", chunk_idx, chunk_id, 0.0, err_msg, device_str, None))
+            continue
+
+        # Keep a passing take, else the best-scoring one; the report shows every take
+        best = max(takes, key=lambda t: (bool(t["passed"]), t["score"] or 0.0))
+        for t in takes:
+            if t is best:
+                Path(t["path"]).replace(out_chunk_path)
+            else:
+                Path(t["path"]).unlink(missing_ok=True)
+        attempts = [{k: v for k, v in t.items() if k != "path"} for t in takes]
+        result = {
+            "passed": best["passed"],
+            "score": best["score"],
+            "seed": best["seed"],
+            "category": best.get("category"),
+            "message": best.get("message"),
+            "transcript": best.get("transcript"),
+            "attempts": attempts,
+        }
+        result_queue.put(("CHUNK_DONE", chunk_idx, chunk_id, best["duration_s"], None, device_str, result))
+
+
+def _synthesize(model, model_name: str, text: str, settings: dict[str, Any], apply_watermark: bool) -> torch.Tensor:
+    with torch.inference_mode():
+        if model_name == MODEL_ORIGINAL:
+            return model.generate(
+                text=text,
+                audio_prompt_path=None,  # Uses cached conditionals
+                repetition_penalty=float(settings.get("repetition_penalty", 1.2)),
+                min_p=float(settings.get("min_p", 0.05)),
+                top_p=float(settings.get("top_p", 1.0)),
+                exaggeration=float(settings.get("exaggeration", 0.5)),
+                cfg_weight=float(settings.get("cfg_weight", 0.5)),
+                temperature=float(settings.get("temperature", 0.8)),
+                apply_watermark=apply_watermark,
+            )
+        return model.generate(
+            text=text,
+            audio_prompt_path=None,
+            repetition_penalty=float(settings.get("repetition_penalty", 1.2)),
+            min_p=float(settings.get("min_p", 0.00)),
+            top_p=float(settings.get("top_p", 0.95)),
+            top_k=int(settings.get("top_k") or 1000),
+            temperature=float(settings.get("temperature", 0.8)),
+            norm_loudness=bool(settings.get("norm_loudness", True)),
+            apply_watermark=apply_watermark,
+        )
 
 
 def detect_devices(device_arg: str | None) -> list[str]:
@@ -308,8 +377,12 @@ def run_batch_narrator(
     smart_trim: bool = True,
     apply_watermark: bool = False,
     test_limit: int | None = None,
-) -> Path:
-    """Main orchestrator for parallel batch narration."""
+    validate: dict[str, Any] | None = None,
+    only_chunks: str | None = None,
+    report_path: str | Path | None = None,
+) -> tuple[Path, list[str]]:
+    """Main orchestrator for parallel batch narration. Returns the master path and the ids of chunks
+    that still fail validation (always empty without --validate)."""
     bp_path = Path(blueprint_path).resolve()
     if not bp_path.exists():
         raise FileNotFoundError(f"Blueprint file not found: {bp_path}")
@@ -349,6 +422,8 @@ def run_batch_narrator(
 
     chunks_dir = work_dir / "chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
+    report_path = Path(report_path) if report_path else final_master_path.with_name("validation_report.json")
+    report = load_report(report_path) if only_chunks else {"chunks": {}}
 
     # Extract chunks
     raw_chunks = blueprint.get("chunks", [])
@@ -367,6 +442,13 @@ def run_batch_narrator(
     print(f"• Reference Audio:   {Path(resolved_ref_audio).name if resolved_ref_audio else 'None (Default)'}")
     print(f"• Active Devices:    {', '.join(devices)} ({len(devices)} parallel worker processes)")
     print(f"• Watermark:         {'Enabled' if apply_watermark else 'Bypassed (0% vocoder loss, max speed)'}")
+    if validate:
+        print(
+            f"• Whisper Check:     {validate['whisper_model']} on each worker's GPU, pass >= {validate['threshold']}, "
+            f"up to {validate['regen_rounds']} regeneration(s) per chunk"
+        )
+    else:
+        print("• Whisper Check:     Off")
     print(f"• Output Master:     {final_master_path}")
     print("=" * 70)
 
@@ -398,6 +480,13 @@ def run_batch_narrator(
             }
         )
 
+    selected = plan_chunks(chunk_manifest, only_chunks, report)
+    tasks = [t for t in tasks if t[0] in selected]
+    manifest_by_index = {item["index"]: item for item in chunk_manifest}
+    if only_chunks:
+        print(f"• Partial Run:       {len(tasks)} of {num_chunks} chunk(s): {', '.join(str(t[1]) for t in tasks)}")
+    num_jobs = len(tasks)
+
     # Start multi-process worker pool using torch.multiprocessing (spawn method)
     mp.set_start_method("spawn", force=True)
 
@@ -416,6 +505,7 @@ def run_batch_narrator(
                 resolved_ref_audio,
                 str(ckpt_dir) if ckpt_dir else None,
                 apply_watermark,
+                validate,
             ),
         )
         p.start()
@@ -429,13 +519,13 @@ def run_batch_narrator(
         if event_type == "WORKER_READY":
             ready_workers += 1
         elif event_type == "WORKER_INIT_ERROR":
-            _, _, _, _, err, dev = msg
+            _, _, _, _, err, dev, _ = msg
             print(f"❌ Worker on {dev} failed to initialize: {err}", file=sys.stderr)
             for w in workers:
                 w.terminate()
             raise RuntimeError(f"Worker on {dev} initialization failed: {err}")
 
-    print(f"⚡ All {len(devices)} GPU worker processes online. Dispatching {num_chunks} chunks...")
+    print(f"⚡ All {len(devices)} GPU worker processes online. Dispatching {num_jobs} chunks...")
     t_start = time.perf_counter()
 
     # Enqueue all tasks
@@ -447,20 +537,26 @@ def run_batch_narrator(
     failed_chunks = []
     total_spoken_seconds = 0.0
 
-    while completed_chunks + len(failed_chunks) < num_chunks:
+    while completed_chunks + len(failed_chunks) < num_jobs:
         msg = result_queue.get()
-        event_type, chunk_idx, chunk_id, duration_s, err, dev = msg
+        event_type, chunk_idx, chunk_id, duration_s, err, dev, result = msg
 
         if event_type == "CHUNK_DONE":
             completed_chunks += 1
             total_spoken_seconds += duration_s
             elapsed = time.perf_counter() - t_start
             pace = elapsed / completed_chunks
-            remaining_sec = pace * (num_chunks - completed_chunks)
+            remaining_sec = pace * (num_jobs - completed_chunks)
+            record_chunk(report, manifest_by_index[chunk_idx], result)
 
+            check = ""
+            if validate:
+                takes = len(result["attempts"])
+                mark = "pass" if result["passed"] else "FAIL"
+                check = f" | Whisper {result['score']:.3f} {mark}" + (f" after {takes} takes" if takes > 1 else "")
             print(
-                f"[{dev}] ✅ Chunk {chunk_id} ({completed_chunks}/{num_chunks}) | "
-                f"Spoken: {duration_s:.1f}s | Elapsed: {elapsed:.1f}s | "
+                f"[{dev}] {'✅' if result['passed'] else '⚠️ '} Chunk {chunk_id} ({completed_chunks}/{num_jobs}) | "
+                f"Spoken: {duration_s:.1f}s{check} | Elapsed: {elapsed:.1f}s | "
                 f"ETA: {remaining_sec:.1f}s"
             )
 
@@ -476,6 +572,14 @@ def run_batch_narrator(
         w.join(timeout=10)
 
     total_wall_sec = time.perf_counter() - t_start
+    report.update(
+        blueprint=bp_path.name,
+        whisper_model=validate["whisper_model"] if validate else None,
+        threshold=validate["threshold"] if validate else None,
+        regen_rounds=validate["regen_rounds"] if validate else None,
+        updated=time.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    save_report(report, report_path)
 
     if failed_chunks:
         print(f"\n⚠️  {len(failed_chunks)} chunk(s) failed generation:", file=sys.stderr)
@@ -505,9 +609,17 @@ def run_batch_narrator(
     print(f"• Spoken Duration:   {final_duration_s / 60.0:.2f} min ({final_duration_s:.1f} seconds)")
     print(f"• Wall-Clock Time:   {total_wall_sec / 60.0:.2f} min ({total_wall_sec:.1f} seconds)")
     print(f"• Throughput Factor: {speedup:.2f}x Real-Time (RTF: {rtf:.3f})")
+    summary = summarize(report)
+    if validate:
+        print(
+            f"• Whisper Check:     {summary['passed']}/{summary['total']} passed, "
+            f"{summary['regenerated']} regenerated, report {report_path.name}"
+        )
+        if summary["failed"]:
+            print(f"• STILL FAILING:     {', '.join(summary['failed'])} (best take merged; listen or rerun them)")
     print("=" * 70)
 
-    return final_master_path
+    return final_master_path, summary["failed"] if validate else []
 
 
 def main() -> None:
@@ -565,9 +677,41 @@ def main() -> None:
         help="Limit execution to the first N chunks (for testing and calibration).",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--validate",
+        action="store_true",
+        help="Whisper-check every chunk on its worker's GPU and regenerate the ones that fail.",
+    )
+    parser.add_argument("--whisper-model", type=str, default="large-v3-turbo", help="faster-whisper model for --validate.")
+    parser.add_argument("--threshold", type=float, default=0.90, help="Pass score for --validate (Gradio default 0.90).")
+    parser.add_argument(
+        "--regen-rounds",
+        type=int,
+        default=3,
+        help="Extra takes (new seed each) for a chunk that fails --validate; the best take is kept.",
+    )
+    parser.add_argument(
+        "--only-chunks",
+        type=str,
+        default=None,
+        help="Regenerate only these chunk ids (comma-separated) or 'failed' (from the report), reuse the other "
+        "chunk wavs in <output dir>/chunks, and re-merge.",
+    )
+    parser.add_argument(
+        "--report",
+        type=str,
+        default=None,
+        help="validation_report.json path (default: next to the output). Read by --only-chunks, then updated.",
+    )
 
-    run_batch_narrator(
+    args = parser.parse_args()
+    validate = (
+        {"whisper_model": args.whisper_model, "threshold": args.threshold, "regen_rounds": args.regen_rounds}
+        if args.validate
+        else None
+    )
+
+    _, still_failing = run_batch_narrator(
         blueprint_path=args.blueprint,
         ref_audio_path=args.ref_audio,
         output_path=args.output,
@@ -576,7 +720,12 @@ def main() -> None:
         smart_trim=not args.no_trim,
         apply_watermark=args.apply_watermark,
         test_limit=args.test_limit,
+        validate=validate,
+        only_chunks=args.only_chunks,
+        report_path=args.report,
     )
+    if still_failing:
+        sys.exit(3)  # merged with the best takes, but some chunks never passed Whisper
 
 
 if __name__ == "__main__":
